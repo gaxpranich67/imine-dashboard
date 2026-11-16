@@ -34,9 +34,10 @@ TAFT_ES = {'n-butylamine': -0.39, 'sec-butylamine': -1.13, 'tert-butylamine': -1
 SUB_COLORS = {'NH2': '#3D7BE0', 'OMe': '#5F9BEF', 'CH3': '#8DB7F2', 'H': '#B9B9C3', 'Cl': '#F0A58F', 'CF3': '#E8735F', 'NO2': '#D2433A'}
 AMINE_COLORS = {'n-butylamine': '#7CC79A', 'sec-butylamine': '#B48CE0', 'tert-butylamine': '#E0A25A'}
 TEMP_COLORS = ['#5B9BF0', '#E8B04B', '#E8615C']
-# Heatmap scales, dark-to-bright so low values recede into the slate background.
-CONVERSION_SCALE = ['#1E2638', '#23406B', '#2A6AA3', '#3E9CC4', '#69C6B8', '#B7E3A0', '#F2F0B6']  # navy → teal → pale lime
-RATE_SCALE = ['#1F1D3A', '#3F2E6E', '#713E8F', '#A64D86', '#D7676B', '#F09452', '#F8CB6E']        # indigo → rose → amber
+# Heatmap scale: blue (low) → light neutral → red (high), matching the app's cool/warm blue and red.
+BLUE_RED_SCALE = ['#1F4E9A', '#3D7BE0', '#8DB7F2', '#E6E3E1', '#F0A58F', '#E8615C', '#B3282D']
+CONVERSION_SCALE = BLUE_RED_SCALE
+RATE_SCALE = BLUE_RED_SCALE
 AMINE_NOTES = {'n-butylamine': 'primary carbon on N', 'sec-butylamine': 'secondary carbon on N',
                'tert-butylamine': 'tertiary carbon on N'}
 SMILES_COLUMNS = {'aldehyde_SMILES', 'amine_SMILES', 'imine_SMILES'}
