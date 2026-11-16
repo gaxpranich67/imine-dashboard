@@ -12,6 +12,8 @@ from rdkit import Chem
 from rdkit.Chem import Crippen, Descriptors, rdMolDescriptors
 from rdkit.Chem.Draw import rdMolDraw2D
 
+from ml import (DESCRIPTORS, add_descriptors, cross_validate, predict_conversion_gbm, predict_conversion_gp,
+                predict_ln_k, train_direct_gbm, train_kinetic_gp)
 from analysis import R_GAS, activation_parameters, conversion, fit_kinetics, linearised, model_comparison, ols, time_to_reach
 
 CSV_PATH = Path(__file__).with_name('imine_condensation_dataset_for_students.csv')
@@ -228,6 +230,18 @@ else:
 act_all = activation_parameters(kin_all)
 
 
+@st.cache_resource(show_spinner='Training prediction models…')
+def prediction_models(frame, order):
+    kin_desc = add_descriptors(fit_kinetics(frame, order), HAMMETT_SIGMA_P, HAMMETT_SIGMA_P_PLUS, TAFT_ES).dropna(subset=DESCRIPTORS)
+    rows = add_descriptors(frame, HAMMETT_SIGMA_P, HAMMETT_SIGMA_P_PLUS, TAFT_ES).dropna(subset=DESCRIPTORS)
+    return train_kinetic_gp(kin_desc), train_direct_gbm(rows), kin_desc
+
+
+@st.cache_data(show_spinner='Cross-validating…')
+def prediction_cv(frame, order):
+    return cross_validate(frame, order, HAMMETT_SIGMA_P, HAMMETT_SIGMA_P_PLUS, TAFT_ES)
+
+
 def show(fig, name, height=None):
     """Render a Plotly chart with a consistent look and a publication-quality download button."""
     fig.update_layout(margin=dict(l=10, r=10, b=10, t=max(50, fig.layout.margin.t or 0)), legend_title_text='',
@@ -266,8 +280,14 @@ k2.metric('Median conversion', f'{filtered.conversion_percent.median():.1f}%')
 k3.metric('Highest conversion', f'{filtered.conversion_percent.max():.1f}%')
 k4.metric('Experiments shown', f'{len(filtered)}')
 
-tab0, tab1, tab_k, tab_h, tab_e, tab2, tab3, tab4 = st.tabs(['Reaction scheme', 'Time courses', 'Kinetics', 'Hammett & Taft',
+tab0, tab_p, tab1, tab_k, tab_h, tab_e, tab2, tab3, tab4 = st.tabs(['Reaction scheme', 'Predict', 'Time courses', 'Kinetics', 'Hammett & Taft',
                                                          'Activation parameters', 'Reactivity map', 'Matched comparisons', 'Data & guide'])
+
+kin = kin_all[kin_all.aldehyde_name.isin(aldehydes) & kin_all.amine_name.isin(amines)
+              & kin_all.solvent.isin(solvents) & kin_all.temperature_C.isin(temperatures)].copy()
+act = act_all[act_all.aldehyde_name.isin(aldehydes) & act_all.amine_name.isin(amines) & act_all.solvent.isin(solvents)].copy()
+ald_by_sigma = sorted(aldehydes, key=lambda a: HAMMETT_SIGMA_P.get(data.loc[data.aldehyde_name == a, 'aldehyde_R_group'].iloc[0], 99))
+R_OF = data.drop_duplicates('aldehyde_name').set_index('aldehyde_name').aldehyde_R_group.to_dict()
 
 with tab0:
     st.subheader('General reaction')
@@ -342,6 +362,225 @@ with tab0:
             st.caption('σ values: Hansch, Leo & Taft, Chem. Rev. 1991, 91, 165. Eₛ: Taft steric constants of the N-alkyl group. '
                        'MW, cLogP and TPSA calculated with RDKit.')
 
+with tab_p:
+    st.subheader('Predict conversion')
+    st.caption('Choose reactants and conditions; machine-learning models trained on this dataset predict conversion, rate and time to target. '
+               'Reactants are described by σp, σp⁺ and Taft Eₛ, so you can also try a substituent or amine that was not measured.')
+    gp_model, gbm_model, kin_desc = prediction_models(data, ORDER)
+    T_LO, T_HI = float(data.temperature_C.min()), float(data.temperature_C.max())
+    TIME_HI = float(data.time_min.max())
+    CUSTOM = 'Custom…'
+
+    i1, i2 = st.columns(2)
+    with i1:
+        ald_known = sorted(R_OF.items(), key=lambda kv: HAMMETT_SIGMA_P.get(kv[1], 99))
+        ald_pick = st.selectbox('Aldehyde', [a for a, _ in ald_known] + [CUSTOM], index=3 if len(ald_known) > 3 else 0, key='p_ald')
+        if ald_pick == CUSTOM:
+            c1, c2, c3 = st.columns(3)
+            p_label = c1.text_input('para-R label', 'Br', key='p_label')
+            p_sp = c2.number_input('σp', -1.0, 1.2, 0.23, 0.01, key='p_sp', help='Hammett σp of the para-substituent (e.g. Br +0.23, F +0.06, CN +0.66).')
+            p_spp = c3.number_input('σp⁺', -2.0, 1.2, 0.15, 0.01, key='p_spp', help='Brown–Okamoto σp⁺ (e.g. Br +0.15, F −0.07, CN +0.66).')
+            p_r = None
+        else:
+            p_r = R_OF[ald_pick]
+            p_label, p_sp, p_spp = sub_label(p_r), HAMMETT_SIGMA_P[p_r], HAMMETT_SIGMA_P_PLUS[p_r]
+            st.caption(f'R = {p_label} · σp {p_sp:+.2f} · σp⁺ {p_spp:+.2f}'.replace('-', '−'))
+    with i2:
+        amine_pick = st.selectbox('Amine', [a for a in amine_options if a in TAFT_ES] + [CUSTOM], key='p_amine')
+        if amine_pick == CUSTOM:
+            c1, c2 = st.columns(2)
+            p_amine_label = c1.text_input('Amine name', 'isobutylamine', key='p_amine_label')
+            p_es = c2.number_input('Taft Eₛ of N-alkyl group', -3.0, 0.5, -0.93, 0.01, key='p_es',
+                                   help='More negative = bulkier. e.g. ethyl −0.07, isopropyl −0.47, isobutyl −0.93, cyclohexyl −0.79.')
+        else:
+            p_amine_label, p_es = amine_pick, TAFT_ES[amine_pick]
+            st.caption(f'Taft Eₛ {p_es:+.2f}'.replace('-', '−'))
+    c1, c2, c3 = st.columns(3)
+    p_solvent = c1.selectbox('Solvent', sorted(data.solvent.unique()), key='p_solvent',
+                             help='Only solvents in the training data can be predicted.')
+    p_temp = c2.slider('Temperature (°C)', 0.0, 60.0, 25.0, 1.0, key='p_temp',
+                       help=f'Measured range {T_LO:g}–{T_HI:g} °C. Outside it the prediction is an extrapolation.')
+    p_time = c3.slider('Reaction time (min)', 1.0, 240.0, 60.0, 1.0, key='p_time',
+                       help=f'Measured up to {TIME_HI:g} min.')
+    c1, c2 = st.columns([2, 1])
+    p_model = c1.radio('Model', ['Kinetic GP (recommended)', 'Direct GBM', 'Compare both'], horizontal=True, key='p_model',
+                       help='Kinetic GP: Gaussian process on ln k + rate law, with 95% interval. Direct GBM: gradient-boosted trees on conversion.')
+    p_target = c2.slider('Target conversion for "time to" (%)', 10, 99, 90, key='p_target')
+
+    feat = np.array([[p_sp, p_spp, p_es, 1.0 if p_solvent.upper() == 'MTBE' else 0.0, 1000 / (p_temp + 273.15)]])
+    centre, low, high, ln_k, ln_k_sd = predict_conversion_gp(gp_model, feat, [p_time], ORDER)
+    k_pred = float(np.exp(ln_k[0]))
+    gbm_at_t = float(predict_conversion_gbm(gbm_model, feat, [p_time])[0, 0])
+    eps = 2.5
+    lk_lo, _ = predict_ln_k(gp_model, np.array([[*feat[0, :4], 1000 / (p_temp - eps + 273.15)]]))
+    lk_hi, _ = predict_ln_k(gp_model, np.array([[*feat[0, :4], 1000 / (p_temp + eps + 273.15)]]))
+    ea_pred = -R_GAS * (lk_hi[0] - lk_lo[0]) / (1 / (p_temp + eps + 273.15) - 1 / (p_temp - eps + 273.15)) / 1000
+
+    # Applicability domain
+    issues = []
+    if not T_LO <= p_temp <= T_HI:
+        issues.append(f'temperature {p_temp:g} °C is outside the measured {T_LO:g}–{T_HI:g} °C')
+    if p_time > TIME_HI:
+        issues.append(f'time {p_time:g} min is beyond the longest measured time ({TIME_HI:g} min)')
+    if not min(HAMMETT_SIGMA_P.values()) <= p_sp <= max(HAMMETT_SIGMA_P.values()):
+        issues.append('σp is outside the range of the training aldehydes')
+    if not min(HAMMETT_SIGMA_P_PLUS.values()) <= p_spp <= max(HAMMETT_SIGMA_P_PLUS.values()):
+        issues.append('σp⁺ is outside the range of the training aldehydes')
+    if not min(TAFT_ES.values()) <= p_es <= max(TAFT_ES.values()):
+        issues.append('Eₛ is outside the range of the training amines')
+    novel = ald_pick == CUSTOM or amine_pick == CUSTOM
+
+    show_gp = p_model != 'Direct GBM'
+    show_gbm = p_model != 'Kinetic GP (recommended)'
+    m = st.columns(4)
+    if show_gp:
+        m[0].metric(f'Conversion at {p_time:g} min', f'{centre[0, 0]:.1f}%', help='Kinetic GP prediction')
+        m[0].caption(f'95% interval {low[0, 0]:.1f}–{high[0, 0]:.1f}%')
+    if show_gbm:
+        (m[1] if show_gp else m[0]).metric(f'Direct GBM at {p_time:g} min', f'{gbm_at_t:.1f}%')
+    t_target = float(time_to_reach(p_target / 100, k_pred, ORDER))
+    m[2].metric(f'Time to {p_target}%', f'{t_target:,.0f} min' if t_target < 1e5 else '> 10⁵ min', help='Kinetic GP + rate law')
+    m[3].metric('Predicted k_app', f'{k_pred:.3g} min⁻¹', help=f'Apparent Eₐ from the model ≈ {ea_pred:.0f} kJ/mol')
+    m[3].caption(f'Eₐ ≈ {ea_pred:.0f} kJ/mol · t½ ≈ {float(time_to_reach(0.5, k_pred, ORDER)):,.0f} min')
+
+    if issues:
+        st.warning('Extrapolation: ' + '; '.join(issues) + '. Treat the numbers as a hypothesis to test, not a result.')
+    elif novel:
+        st.info('Inside the descriptor range, but this reactant was not measured. Leave-one-aldehyde-out validation suggests '
+                'typical errors of about ±10–15 percentage points for a new substrate.')
+    else:
+        st.success('Inside the measured domain. Cross-validated error for new conditions is well under 1 percentage point.')
+
+    if p_r is not None and amine_pick != CUSTOM and SMILES_COLUMNS.issubset(data.columns):
+        row = data[(data.aldehyde_name == ald_pick) & (data.amine_name == amine_pick)].iloc[0]
+        scheme([('mol', row.aldehyde_SMILES, ald_pick), ('op', '+'), ('mol', row.amine_SMILES, amine_pick),
+                ('arrow', f'{p_solvent}, {p_temp:g} °C', f'{p_time:g} min · predicted {centre[0, 0]:.0f}%'),
+                ('mol', row.imine_SMILES, 'imine product'), ('op', '+'), ('mol', 'O', 'water')])
+
+    t_grid = np.linspace(0, max(p_time, TIME_HI) * 1.15, 150)
+    fig = go.Figure()
+    if show_gp:
+        c_mid, c_lo, c_hi, _, _ = predict_conversion_gp(gp_model, feat, t_grid, ORDER)
+        fig.add_scatter(x=np.r_[t_grid, t_grid[::-1]], y=np.r_[c_hi[0], c_lo[0][::-1]], fill='toself', line=dict(width=0),
+                        fillcolor='rgba(122,184,245,0.22)', name='GP 95% interval', hoverinfo='skip')
+        fig.add_scatter(x=t_grid, y=c_mid[0], mode='lines', line=dict(color='#7AB8F5', width=3), name='Kinetic GP')
+    if show_gbm:
+        fig.add_scatter(x=t_grid, y=predict_conversion_gbm(gbm_model, feat, t_grid)[0], mode='lines',
+                        line=dict(color='#E8B04B', width=2, dash='dash'), name='Direct GBM')
+    if p_r is not None and amine_pick != CUSTOM:
+        measured = data[(data.aldehyde_name == ald_pick) & (data.amine_name == amine_pick) & (data.solvent == p_solvent)
+                        & (data.temperature_C == p_temp)]
+        if not measured.empty:
+            fig.add_scatter(x=measured.time_min, y=measured.conversion_percent, mode='markers', name='Measured',
+                            marker=dict(size=11, color='#E8615C', symbol='diamond'))
+    fig.add_vrect(x0=TIME_HI, x1=t_grid.max(), fillcolor='rgba(127,127,127,0.12)', line_width=0)
+    fig.add_vline(x=p_time, line_dash='dot', line_color='gray')
+    fig.update_layout(xaxis_title='Time (min)', yaxis_title='Conversion (%)', hovermode='x unified',
+                      legend=dict(orientation='h', yanchor='bottom', y=1.02, x=0), margin=dict(t=80))
+    fig.update_yaxes(range=[0, 102])
+    a, b = st.columns(2)
+    with a:
+        st.markdown('**Predicted time course**')
+        show(fig, 'predicted_time_course', height=380)
+        st.caption('Grey band: beyond the longest measured time.')
+    with b:
+        st.markdown(f'**Temperature response at {p_time:g} min**')
+        temp_grid = np.linspace(0, 60, 61)
+        feats = np.column_stack([np.repeat(feat[:, :4], len(temp_grid), axis=0), 1000 / (temp_grid + 273.15)])
+        fig = go.Figure()
+        if show_gp:
+            c_mid, c_lo, c_hi, _, _ = predict_conversion_gp(gp_model, feats, [p_time], ORDER)
+            fig.add_scatter(x=np.r_[temp_grid, temp_grid[::-1]], y=np.r_[c_hi[:, 0], c_lo[::-1, 0]], fill='toself',
+                            line=dict(width=0), fillcolor='rgba(122,184,245,0.22)', name='GP 95% interval', hoverinfo='skip')
+            fig.add_scatter(x=temp_grid, y=c_mid[:, 0], mode='lines', line=dict(color='#7AB8F5', width=3), name='Kinetic GP')
+        if show_gbm:
+            fig.add_scatter(x=temp_grid, y=predict_conversion_gbm(gbm_model, feats, [p_time])[:, 0], mode='lines',
+                            line=dict(color='#E8B04B', width=2, dash='dash'), name='Direct GBM')
+        fig.add_vrect(x0=T_LO, x1=T_HI, fillcolor='rgba(124,199,154,0.12)', line_width=0)
+        fig.add_vline(x=p_temp, line_dash='dot', line_color='gray')
+        fig.update_layout(xaxis_title='Temperature (°C)', yaxis_title='Conversion (%)', hovermode='x unified',
+                          legend=dict(orientation='h', yanchor='bottom', y=1.02, x=0), margin=dict(t=80))
+        fig.update_yaxes(range=[0, 102])
+        show(fig, 'predicted_temperature_response', height=380)
+        st.caption('Green band: measured temperature range.' + (' Note how the GBM goes flat outside it: trees cannot extrapolate.'
+                                                                if show_gbm else ''))
+
+    with st.expander('Batch predictions from a CSV'):
+        st.markdown('Columns: `solvent`, `temperature_C`, `time_min`, plus either `aldehyde_R_group` or `sigma_p` (and optionally '
+                    '`sigma_p_plus`), and either `amine_name` or `taft_Es`.')
+        template = pd.DataFrame({'aldehyde_R_group': ['H', 'NO2', ''], 'sigma_p': ['', '', 0.23], 'sigma_p_plus': ['', '', 0.15],
+                                 'amine_name': ['n-butylamine', 'tert-butylamine', ''], 'taft_Es': ['', '', -0.93],
+                                 'solvent': ['DCM', 'MTBE', 'DCM'], 'temperature_C': [25, 35, 20], 'time_min': [60, 80, 45]})
+        st.download_button('Download template', template.to_csv(index=False).encode(), file_name='prediction_template.csv', mime='text/csv')
+        batch_file = st.file_uploader('Upload conditions', type='csv', key='batch_file')
+        if batch_file is not None:
+            batch = pd.read_csv(batch_file)
+            try:
+                b = batch.copy()
+                if 'sigma_p' not in b or b.sigma_p.isna().any():
+                    b['sigma_p'] = b.get('sigma_p', pd.Series(np.nan, index=b.index)).fillna(b.aldehyde_R_group.map(HAMMETT_SIGMA_P))
+                if 'sigma_p_plus' not in b or b.sigma_p_plus.isna().any():
+                    b['sigma_p_plus'] = b.get('sigma_p_plus', pd.Series(np.nan, index=b.index)).fillna(
+                        b.get('aldehyde_R_group', pd.Series(dtype=str)).map(HAMMETT_SIGMA_P_PLUS)).fillna(b.sigma_p)
+                if 'taft_Es' not in b or b.taft_Es.isna().any():
+                    b['taft_Es'] = b.get('taft_Es', pd.Series(np.nan, index=b.index)).fillna(b.amine_name.map(TAFT_ES))
+                b = add_descriptors(b, HAMMETT_SIGMA_P, HAMMETT_SIGMA_P_PLUS, TAFT_ES)
+                ok = b[DESCRIPTORS + ['time_min']].notna().all(axis=1)
+                X = b.loc[ok, DESCRIPTORS].to_numpy(float)
+                out = batch.copy()
+                for col in ('gp_conversion_percent', 'gp_low_95', 'gp_high_95', 'gbm_conversion_percent', 'k_app_per_min'):
+                    out[col] = np.nan
+                if ok.any():
+                    mean, sd = predict_ln_k(gp_model, X)
+                    t = b.loc[ok, 'time_min'].to_numpy(float)
+                    out.loc[ok, 'gp_conversion_percent'] = conversion(t, np.exp(mean), ORDER) * 100
+                    out.loc[ok, 'gp_low_95'] = conversion(t, np.exp(mean - 1.96 * sd), ORDER) * 100
+                    out.loc[ok, 'gp_high_95'] = conversion(t, np.exp(mean + 1.96 * sd), ORDER) * 100
+                    out.loc[ok, 'gbm_conversion_percent'] = np.clip(gbm_model.predict(b.loc[ok, DESCRIPTORS + ['time_min']].to_numpy(float)), 0, 100)
+                    out.loc[ok, 'k_app_per_min'] = np.exp(mean)
+                if (~ok).any():
+                    st.warning(f'{int((~ok).sum())} row(s) lacked descriptors or conditions and were left blank.')
+                st.dataframe(out, hide_index=True, width='stretch')
+                st.download_button('Download predictions', out.to_csv(index=False).encode(), file_name='imine_predictions.csv', mime='text/csv')
+            except Exception as error:  # show a readable message rather than a stack trace
+                st.error(f'Could not read that file: {error}')
+
+    with st.expander('How the models work and how well they validate'):
+        st.markdown(f'''
+**Descriptors.** Aldehyde: σp and σp⁺ of the para-substituent. Amine: Taft Eₛ of the N-alkyl group. Solvent: DCM / MTBE indicator.
+Temperature: 1000/T. Time enters only through the rate law (GP) or as a feature (GBM).
+
+**Kinetic GP (recommended).** The {len(kin_desc)} fitted rate constants (Kinetics tab, order n = {ORDER:.2f}) are learned as ln k_app by a
+Gaussian process (anisotropic RBF + white-noise kernel, standardised inputs). Conversion follows from the rate law, so curves are smooth,
+start at 0, never exceed 100% and carry a 95% interval from the GP variance (parameter uncertainty only, not rate-law error).
+
+**Direct GBM.** Histogram gradient-boosted trees predict conversion (%) from the descriptors and time, constrained to increase with time
+and temperature. It needs no kinetic model but is step-like and flat outside the training range.
+''')
+        if st.toggle('Run cross-validation (takes ~15 s the first time)', key='run_cv'):
+            cv_table, cv_preds = prediction_cv(data, ORDER)
+            st.dataframe(cv_table, hide_index=True, width='stretch', column_config={
+                'RMSE (pp)': st.column_config.NumberColumn(format='%.2f'), 'MAE (pp)': st.column_config.NumberColumn(format='%.2f'),
+                'R²': st.column_config.NumberColumn(format='%.3f')})
+            scheme_pick = st.radio('Parity plot for', cv_table.Validation.unique().tolist(), horizontal=True, key='cv_scheme')
+            sub = cv_preds[cv_preds.Validation == scheme_pick]
+            fig = px.scatter(sub, x='observed', y='predicted', color='Model', opacity=0.65,
+                             color_discrete_map={'Kinetic GP': '#7AB8F5', 'Direct GBM': '#E8B04B'},
+                             hover_data=['aldehyde_R_group', 'amine_name'],
+                             labels={'observed': 'Measured conversion (%)', 'predicted': 'Out-of-sample prediction (%)'})
+            fig.add_scatter(x=[0, 100], y=[0, 100], mode='lines', line=dict(color='gray', dash='dash'), showlegend=False)
+            show(fig, 'parity_plot', height=420)
+            st.caption('Random 5-fold = new conditions for known reactants. Leave one aldehyde out = a substrate the model has never seen; '
+                       'this is the honest guide to accuracy for custom reactants.')
+        ls = gp_model[-1].kernel_.k1.k2.length_scale
+        rel = pd.DataFrame({'Descriptor': ['σp', 'σp⁺', 'Taft Eₛ', 'Solvent (MTBE)', '1000/T'], 'Length scale': ls,
+                            'Relevance (1/length scale)': 1 / np.asarray(ls)})
+        st.markdown('**What the GP relies on.** Shorter length scale (higher relevance) = ln k changes faster with that descriptor.')
+        st.dataframe(rel, hide_index=True, width='stretch', column_config={
+            'Length scale': st.column_config.NumberColumn(format='%.2f'),
+            'Relevance (1/length scale)': st.column_config.ProgressColumn(format='%.2f', min_value=0,
+                                                                           max_value=float((1 / np.asarray(ls)).max()))})
+
 with tab1:
     st.subheader('How conversion changes over time')
     st.caption('Colour = temperature, line style = solvent. Each line averages the selected aldehydes and amines. '
@@ -386,11 +625,6 @@ with tab1:
     st.caption('The y-axis starts at 0 and is scaled to the data shown, so the lines are easier to tell apart.')
     st.caption('Only sampled time points are connected; lines do not establish a kinetic model.')
 
-kin = kin_all[kin_all.aldehyde_name.isin(aldehydes) & kin_all.amine_name.isin(amines)
-              & kin_all.solvent.isin(solvents) & kin_all.temperature_C.isin(temperatures)].copy()
-act = act_all[act_all.aldehyde_name.isin(aldehydes) & act_all.amine_name.isin(amines) & act_all.solvent.isin(solvents)].copy()
-ald_by_sigma = sorted(aldehydes, key=lambda a: HAMMETT_SIGMA_P.get(data.loc[data.aldehyde_name == a, 'aldehyde_R_group'].iloc[0], 99))
-R_OF = data.drop_duplicates('aldehyde_name').set_index('aldehyde_name').aldehyde_R_group.to_dict()
 
 with tab_k:
     st.subheader('Which rate law describes the data?')
@@ -779,6 +1013,7 @@ with tab4:
 | Tab | Use it to |
 |---|---|
 | Reaction scheme | See the reaction, any specific example, and the substrate set with σ / Eₛ values |
+| Predict | ML predictions of conversion, rate and time to target for any reactants and conditions, with batch CSV mode |
 | Time courses | Compare averaged conversion curves by temperature and solvent |
 | Kinetics | Choose a rate law, inspect fits and residuals, map rate constants, plan conditions |
 | Hammett & Taft | Electronic (ρ) and steric (δ) sensitivity, how ρ changes with conditions, σp vs σp⁺ |
