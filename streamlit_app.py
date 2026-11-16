@@ -1,24 +1,96 @@
+import base64
+from html import escape
 from pathlib import Path
 
 import pandas as pd
 import plotly.express as px
 import streamlit as st
+from rdkit import Chem
+from rdkit.Chem.Draw import rdMolDraw2D
 
 CSV_PATH = Path(__file__).with_name('imine_condensation_dataset_for_students.csv')
 # Para-substituents ordered by Hammett sigma_p (electron-donating -> electron-withdrawing).
 R_GROUP_ORDER = ['NH2', 'OMe', 'CH3', 'H', 'Cl', 'CF3', 'NO2']
+HAMMETT_SIGMA_P = {'NH2': -0.66, 'OMe': -0.27, 'CH3': -0.17, 'H': 0.00, 'Cl': 0.23, 'CF3': 0.54, 'NO2': 0.78}
+AMINE_NOTES = {'n-butylamine': 'primary carbon on N', 'sec-butylamine': 'secondary carbon on N',
+               'tert-butylamine': 'tertiary carbon on N'}
+SMILES_COLUMNS = {'aldehyde_SMILES', 'amine_SMILES', 'imine_SMILES'}
+# Generic structures: atom-map 1 is drawn as "Ar", atom-map 2 as "R'".
+GENERIC = {'aldehyde': '[*:1]C=O', 'amine': 'N[*:2]', 'hemiaminal': '[*:1]C(O)N[*:2]',
+           'imine': '[*:1]C=N[*:2]', 'water': 'O'}
 REQUIRED = {
     'aldehyde_name', 'aldehyde_R_group', 'amine_name', 'solvent',
     'temperature_C', 'time_min', 'conversion_percent',
 }
 
-st.set_page_config(page_title='Imine Reaction Explorer', page_icon='⚗️', layout='wide')
-st.title('⚗️ Imine Reaction Explorer')
+st.set_page_config(page_title='Imine Reaction Explorer', layout='wide')
+st.title('Imine Reaction Explorer')
 st.caption('Explore 504 imine-condensation measurements: 7 aldehydes × 3 amines × 2 solvents × 3 temperatures × 4 times.')
 
 @st.cache_data
 def read_csv(source):
     return pd.read_csv(source)
+
+
+@st.cache_data
+def structure_svg(smiles, bond_length=26):
+    """Inline RDKit SVG of `smiles`. The carbon skeleton uses currentColor, so it follows the page theme."""
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        return f'<code>{escape(smiles)}</code>'
+    for atom in mol.GetAtoms():
+        label = {1: 'Ar', 2: "R'"}.get(atom.GetAtomMapNum())
+        if label:
+            atom.SetAtomMapNum(0)
+            atom.SetProp('atomLabel', label)
+    drawer = rdMolDraw2D.MolDraw2DSVG(-1, -1)  # canvas sized to the molecule, so every structure shares one scale
+    options = drawer.drawOptions()
+    options.clearBackground = False
+    options.fixedBondLength = bond_length
+    options.bondLineWidth = 2
+    options.minFontSize = 14
+    options.padding = 0.12
+    # Heteroatom colours chosen to read on both light and dark backgrounds.
+    options.updateAtomPalette({0: (0, 0, 0), 7: (0.35, 0.58, 0.98), 8: (0.93, 0.36, 0.34), 9: (0.30, 0.74, 0.45), 17: (0.30, 0.74, 0.45)})
+    rdMolDraw2D.PrepareAndDrawMolecule(drawer, mol)
+    drawer.FinishDrawing()
+    svg = drawer.GetDrawingText()
+    return svg[svg.index('<svg'):].replace('#000000', 'currentColor').replace('\n', ' ')
+
+
+SCHEME_CSS = '''<style>
+.scheme {display:flex; flex-wrap:wrap; align-items:center; justify-content:center; gap:0.4rem 1rem; margin:0.5rem 0 1rem;}
+.scheme figure {margin:0; display:flex; flex-direction:column; align-items:center;}
+.scheme figcaption {font-size:0.82rem; opacity:0.8; text-align:center; max-width:14rem;}
+.scheme .op {font-size:1.8rem; opacity:0.85;}
+.scheme .arrow {display:flex; flex-direction:column; align-items:center; min-width:7rem; font-size:0.8rem; opacity:0.9;}
+.scheme .arrow b {font-size:2.4rem; line-height:1; font-weight:400;}
+.gallery {display:flex; flex-wrap:wrap; gap:0.75rem; margin-bottom:1rem;}
+.gallery figure {margin:0; padding:0.5rem 0.75rem; border-radius:0.5rem; background:rgba(127,127,127,0.1);
+                 display:flex; flex-direction:column; align-items:center; justify-content:flex-end; min-width:9rem;}
+.gallery figcaption {font-size:0.82rem; text-align:center;}
+.gallery small {opacity:0.75;}
+</style>'''
+
+
+def scheme(parts, bond_length=26):
+    """parts: ('mol', smiles, caption) | ('op', text) | ('arrow', above, below)."""
+    html = []
+    for part in parts:
+        if part[0] == 'mol':
+            html.append(f'<figure>{structure_svg(part[1], bond_length)}<figcaption>{escape(part[2])}</figcaption></figure>')
+        elif part[0] == 'op':
+            html.append(f'<span class="op">{escape(part[1])}</span>')
+        else:
+            html.append(f'<div class="arrow"><span>{escape(part[1])}</span><b>&#8652;</b><span>{escape(part[2])}</span></div>')
+    st.markdown(SCHEME_CSS + '<div class="scheme">' + ''.join(html) + '</div>', unsafe_allow_html=True)
+
+
+def gallery(items):
+    """items: (smiles, title, subtitle)."""
+    cards = ''.join(f'<figure>{structure_svg(smiles, 22)}<figcaption>{escape(title)}<br><small>{escape(sub)}</small></figcaption></figure>'
+                    for smiles, title, sub in items)
+    st.markdown(SCHEME_CSS + f'<div class="gallery">{cards}</div>', unsafe_allow_html=True)
 
 if CSV_PATH.exists():
     data = read_csv(CSV_PATH)
@@ -64,7 +136,55 @@ k2.metric('Median conversion', f'{filtered.conversion_percent.median():.1f}%')
 k3.metric('Highest conversion', f'{filtered.conversion_percent.max():.1f}%')
 k4.metric('Experiments shown', f'{len(filtered)}')
 
-tab1, tab2, tab3, tab4 = st.tabs(['Time courses', 'Reactivity map', 'Matched comparisons', 'Measurements & guide'])
+tab0, tab1, tab2, tab3, tab4 = st.tabs(['Reaction scheme', 'Time courses', 'Reactivity map', 'Matched comparisons', 'Measurements & guide'])
+
+with tab0:
+    st.subheader('General reaction')
+    scheme([('mol', GENERIC['aldehyde'], 'aryl aldehyde'), ('op', '+'), ('mol', GENERIC['amine'], 'primary amine'),
+            ('arrow', 'addition', ''), ('mol', GENERIC['hemiaminal'], 'hemiaminal (intermediate, not measured)'),
+            ('arrow', 'dehydration', ''), ('mol', GENERIC['imine'], 'imine (Schiff base)'), ('op', '+'),
+            ('mol', GENERIC['water'], 'water')], bond_length=36)
+    st.caption('The amine adds to the carbonyl carbon to give a hemiaminal, which loses water to form the C=N bond. '
+               'Both steps are reversible. Electron-withdrawing para-substituents make the carbonyl carbon more electrophilic; '
+               'bulky groups next to the amine nitrogen hinder the addition.')
+
+    if not SMILES_COLUMNS.issubset(data.columns):
+        st.info('Add aldehyde_SMILES, amine_SMILES and imine_SMILES columns to the CSV to draw specific reactions.')
+    else:
+        st.subheader('A specific reaction from the dataset')
+        c1, c2, c3, c4 = st.columns(4)
+        ald_options = [a for a in data.drop_duplicates('aldehyde_name').assign(
+            sigma=lambda d: d.aldehyde_R_group.map(HAMMETT_SIGMA_P)).sort_values('sigma').aldehyde_name if a in aldehydes]
+        pick_ald = c1.selectbox('Aldehyde', ald_options)
+        pick_amine = c2.selectbox('Amine', amines)
+        pick_solvent = c3.selectbox('Solvent', solvents)
+        pick_temp = c4.selectbox('Temperature (°C)', temperatures, index=len(temperatures) // 2,
+                                 format_func=lambda t: f'{t:g}')
+        rxn = data[(data.aldehyde_name == pick_ald) & (data.amine_name == pick_amine)]
+        row = rxn.iloc[0]
+        scheme([('mol', row.aldehyde_SMILES, pick_ald), ('op', '+'), ('mol', row.amine_SMILES, pick_amine),
+                ('arrow', pick_solvent, f'{pick_temp:g} °C'), ('mol', row.imine_SMILES, 'imine product'),
+                ('op', '+'), ('mol', 'O', 'water')])
+        course = rxn[(rxn.solvent == pick_solvent) & (rxn.temperature_C == pick_temp)].sort_values('time_min')
+        if course.empty:
+            st.info('This combination was not measured.')
+        else:
+            st.markdown('**Measured conversion**')
+            for column, (_, point) in zip(st.columns(len(course)), course.iterrows()):
+                column.metric(f'{point.time_min:g} min', f'{point.conversion_percent:.1f}%')
+
+        st.subheader('Substrates')
+        st.markdown('**Aldehydes**, from electron-donating to electron-withdrawing (Hammett σp)')
+        alds = data.drop_duplicates('aldehyde_name')
+        alds = alds.assign(order=alds.aldehyde_R_group.map({r: i for i, r in enumerate(R_GROUP_ORDER)})).sort_values('order')
+        gallery([(r.aldehyde_SMILES, r.aldehyde_name,
+                  f'R = {r.aldehyde_R_group}' + (f', σp = {HAMMETT_SIGMA_P[r.aldehyde_R_group]:+.2f}'
+                                                 if r.aldehyde_R_group in HAMMETT_SIGMA_P else ''))
+                 for r in alds.itertuples()])
+        st.markdown('**Amines**, increasing steric bulk at the carbon next to nitrogen')
+        amine_rows = data.drop_duplicates('amine_name').set_index('amine_name')
+        gallery([(amine_rows.loc[a, 'amine_SMILES'], a, AMINE_NOTES.get(a, ''))
+                 for a in sorted(amine_rows.index, key=lambda n: (list(AMINE_NOTES).index(n) if n in AMINE_NOTES else 99, n))])
 
 with tab1:
     st.subheader('How conversion changes over time')
