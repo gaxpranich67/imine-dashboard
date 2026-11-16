@@ -34,6 +34,9 @@ TAFT_ES = {'n-butylamine': -0.39, 'sec-butylamine': -1.13, 'tert-butylamine': -1
 SUB_COLORS = {'NH2': '#3D7BE0', 'OMe': '#5F9BEF', 'CH3': '#8DB7F2', 'H': '#B9B9C3', 'Cl': '#F0A58F', 'CF3': '#E8735F', 'NO2': '#D2433A'}
 AMINE_COLORS = {'n-butylamine': '#7CC79A', 'sec-butylamine': '#B48CE0', 'tert-butylamine': '#E0A25A'}
 TEMP_COLORS = ['#5B9BF0', '#E8B04B', '#E8615C']
+# Heatmap scales, dark-to-bright so low values recede into the slate background.
+CONVERSION_SCALE = ['#1E2638', '#23406B', '#2A6AA3', '#3E9CC4', '#69C6B8', '#B7E3A0', '#F2F0B6']  # navy → teal → pale lime
+RATE_SCALE = ['#1F1D3A', '#3F2E6E', '#713E8F', '#A64D86', '#D7676B', '#F09452', '#F8CB6E']        # indigo → rose → amber
 AMINE_NOTES = {'n-butylamine': 'primary carbon on N', 'sec-butylamine': 'secondary carbon on N',
                'tert-butylamine': 'tertiary carbon on N'}
 SMILES_COLUMNS = {'aldehyde_SMILES', 'amine_SMILES', 'imine_SMILES'}
@@ -65,12 +68,13 @@ APP_CSS = '''<style>
 [data-testid="stMetricLabel"] p {font-size: 0.74rem; font-weight: 500; letter-spacing: 0.06em; text-transform: uppercase; opacity: 0.72;}
 [data-testid="stMetricValue"] {letter-spacing: -0.01em;}
 /* Tabs */
-.stTabs [data-baseweb="tab-list"] {gap: 0.15rem; border-bottom: 1px solid rgba(127,127,127,0.22);}
-.stTabs [data-baseweb="tab"] {padding: 0.55rem 0.85rem; border-radius: 0.5rem 0.5rem 0 0;}
-.stTabs [data-baseweb="tab"] p {font-size: 0.9rem; font-weight: 500;}
-.stTabs [data-baseweb="tab"]:hover {background: rgba(127,127,127,0.08);}
-.stTabs [aria-selected="true"] {background: rgba(122,184,245,0.10);}
-.stTabs [data-baseweb="tab-panel"] {padding-top: 1.1rem;}
+.stTabs [role="tablist"] {gap: 0.3rem; padding-bottom: 0.5rem; border-bottom: 1px solid rgba(127,127,127,0.22); box-shadow: none;}
+.stTabs [data-testid="stTab"] {padding: 0.45rem 0.9rem; border-radius: 0.6rem; border: 1px solid transparent; transition: background 0.15s;}
+.stTabs [data-testid="stTab"] p {font-size: 0.9rem; font-weight: 500;}
+.stTabs [data-testid="stTab"]:hover {background: rgba(127,127,127,0.10);}
+.stTabs [data-testid="stTab"][aria-selected="true"] {background: rgba(122,184,245,0.15); border-color: rgba(122,184,245,0.5);}
+.stTabs .react-aria-SelectionIndicator {display: none;}
+.stTabs [role="tabpanel"] {padding-top: 1.1rem;}
 /* Headings and captions */
 .stMainBlockContainer h3 {letter-spacing: -0.01em; padding-top: 0.9rem;}
 [data-testid="stCaptionContainer"] {line-height: 1.5;}
@@ -916,10 +920,11 @@ with tab_k:
         sub = kin[(kin.solvent == map_solvent) & (kin.temperature_C == map_temp)]
         grid = sub.pivot_table(index='aldehyde_R_group', columns='amine_name', values='k_app_per_min')
         grid = grid.reindex([r for r in R_GROUP_ORDER if r in grid.index]).reindex(columns=[a for a in amine_options if a in grid.columns])
-        fig = px.imshow(np.log10(grid), color_continuous_scale='Viridis', aspect='auto',
+        fig = px.imshow(np.log10(grid), color_continuous_scale=RATE_SCALE, aspect='auto',
                         labels={'x': 'Amine', 'y': 'para-R (donating → withdrawing)', 'color': 'log₁₀ k_app'})
         fig.update_traces(text=grid.map(lambda v: f'{v:.2e}').to_numpy(), texttemplate='%{text}',
                           hovertemplate='R = %{y}<br>%{x}<br>k_app = %{text} min⁻¹<extra></extra>')
+        fig.update_traces(xgap=2, ygap=2)
         show(fig, 'rate_constant_map', height=420)
         st.caption('Colour is log₁₀ k_app, so equal colour steps are equal factors in rate. Numbers are k_app in min⁻¹.')
     with st.expander('All fitted rate constants (current filters)'):
@@ -1128,14 +1133,32 @@ with tab2:
                                 values='conversion_percent', aggfunc='mean')
     order = [r for r in R_GROUP_ORDER if r in heat.index] + [r for r in heat.index if r not in R_GROUP_ORDER]
     heat = heat.reindex(order)
-    fig = px.imshow(heat, text_auto='.1f', color_continuous_scale='Viridis', zmin=0, zmax=100,
+    fig = px.imshow(heat, text_auto='.1f', color_continuous_scale=CONVERSION_SCALE, zmin=0, zmax=100,
                     labels={'x': 'Amine', 'y': 'Aldehyde R group (donating → withdrawing)', 'color': 'Conversion (%)'},
                     aspect='auto')
+    fig.update_traces(xgap=2, ygap=2)
     show(fig, 'reactivity_map', height=460)
     st.caption('For fairer comparisons, select one temperature, one time and one solvent in the sidebar.')
 
 with tab3:
     st.subheader('Compare like-for-like experiments')
+    with st.expander('How this comparison works'):
+        st.markdown('''
+Averages across the whole dataset can mislead, because the groups being compared may differ in other ways too.
+This tab avoids that by **pairing experiments that are identical except for the one variable you choose**.
+
+1. Pick a comparison, e.g. *Solvent: MTBE − DCM*.
+2. Every MTBE measurement is paired with the DCM measurement that has the **same aldehyde, amine, temperature and time**.
+3. For each pair the tab computes **conversion(MTBE) − conversion(DCM)** in percentage points.
+4. The histogram shows how those differences are spread; the headline number is their mean.
+
+**Reading it.** Bars right of the dashed zero line are pairs where the second-named condition (MTBE, 35 °C or n-butylamine) gave
+higher conversion. A narrow cluster means the effect is consistent; a wide spread means it depends on the other variables, so open
+*See matched experiments* to find where it is large or small. Differences are in percentage points, not percent change
+(40% → 50% is +10 pp).
+
+**Filters.** Only experiments allowed by the sidebar are paired, and both conditions being compared must be selected there.
+''')
     comparison = st.radio('Change one variable while holding the others fixed',
                           ['Solvent: MTBE − DCM', 'Temperature: 35 − 15 °C',
                            'Amine: n-butylamine − tert-butylamine'], horizontal=True)
