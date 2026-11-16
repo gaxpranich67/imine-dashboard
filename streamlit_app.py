@@ -255,7 +255,7 @@ with tab0:
 
 with tab1:
     st.subheader('How conversion changes over time')
-    st.caption('One panel per solvent; each line is one temperature, averaged over the selected aldehydes and amines. '
+    st.caption('Colour = temperature, line style = solvent. Each line averages the selected aldehydes and amines. '
                'Use the sidebar to isolate a specific reaction.')
     traces = filtered.groupby(['time_min', 'temperature_C', 'solvent'], as_index=False)['conversion_percent'].mean()
     temp_values = sorted(traces.temperature_C.unique())
@@ -264,18 +264,35 @@ with tab1:
     # Cool-to-warm colours, so colder runs read as blue and hotter runs as red.
     warm = ['#5B9BF0', '#E8B04B', '#E8615C'] if len(temp_values) <= 3 else \
         px.colors.sample_colorscale('Turbo', [i / (len(temp_values) - 1) for i in range(len(temp_values))])
-    fig = px.line(traces, x='time_min', y='conversion_percent', color='Temperature', facet_col='solvent',
-                  markers=True, category_orders={'Temperature': temp_labels},
+    solvent_values = sorted(traces.solvent.unique())
+    fig = px.line(traces, x='time_min', y='conversion_percent', color='Temperature', line_dash='solvent',
+                  symbol='solvent', markers=True,
+                  category_orders={'Temperature': temp_labels, 'solvent': solvent_values},
                   color_discrete_sequence=warm[-len(temp_values):] if len(temp_values) < 3 else warm,
+                  line_dash_sequence=['solid', 'dash', 'dot', 'dashdot'],
+                  symbol_sequence=['circle', 'diamond', 'square', 'triangle-up'],
                   labels={'time_min': 'Time (min)', 'conversion_percent': 'Mean conversion (%)', 'solvent': 'Solvent'},
-                  hover_data={'solvent': False, 'conversion_percent': ':.1f'})
-    fig.for_each_annotation(lambda a: a.update(text=f'<b>{a.text.split("=")[-1]}</b>', font_size=14))
+                  hover_data={'conversion_percent': ':.1f'})
     fig.update_traces(line_width=3, marker_size=9)
+    # Label each line at its last point so the legend is not needed to tell them apart.
+    ends = traces.sort_values('time_min').groupby(['solvent', 'Temperature'], as_index=False).last()
+    color_of = dict(zip(temp_labels, warm[-len(temp_values):] if len(temp_values) < 3 else warm))
     top = traces.conversion_percent.max()
-    fig.update_yaxes(range=[0, min(105, (int(top // 10) + 2) * 10)], gridcolor='rgba(127,127,127,0.2)')
-    fig.update_xaxes(tickvals=sorted(traces.time_min.unique()))
-    fig.update_layout(height=460, legend=dict(orientation='h', yanchor='bottom', y=1.1, xanchor='left', x=0), margin=dict(t=90),
-                      hovermode='x unified')
+    y_max = min(105, (int(top // 10) + 2) * 10)
+    # Spread labels that would overlap: keep at least ~4% of the axis between neighbours.
+    ends = ends.sort_values('conversion_percent').reset_index(drop=True)
+    gap, label_y = 0.045 * y_max, []
+    for value in ends.conversion_percent:
+        label_y.append(max(value, label_y[-1] + gap) if label_y else value)
+    for end, y in zip(ends.itertuples(), label_y):
+        fig.add_annotation(x=end.time_min, y=y, text=f'{end.solvent} {end.Temperature}',
+                           showarrow=False, xanchor='left', xshift=10, font=dict(color=color_of[end.Temperature], size=12))
+    times_shown = sorted(traces.time_min.unique())
+    span = max(times_shown) - min(times_shown) or 10
+    fig.update_yaxes(range=[0, max(y_max, label_y[-1] + gap)], gridcolor='rgba(127,127,127,0.2)')
+    fig.update_xaxes(tickvals=times_shown, range=[min(times_shown) - 0.05 * span, max(times_shown) + 0.28 * span])
+    fig.update_layout(height=500, legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='left', x=0, title_text=''),
+                      margin=dict(t=70), hovermode='x unified')
     st.plotly_chart(fig, width='stretch')
     st.caption('The y-axis starts at 0 and is scaled to the data shown, so the lines are easier to tell apart.')
     st.caption('Only sampled time points are connected; lines do not establish a kinetic model.')
