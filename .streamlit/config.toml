@@ -3,5 +3,26 @@
 base = "dark"
 primaryColor = "#7AB8F5"
 backgroundColor = "#2B303B"
-secondaryBackgroundColor = "#363C49"
+secondaryBackgroundColor = "#343A47"
 textColor = "#E4E7EC"
+borderColor = "#424958"
+linkColor = "#8EC5FA"
+font = "Inter:https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap, sans-serif"
+codeFont = "JetBrains Mono:https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&display=swap, monospace"
+baseFontSize = 15
+baseRadius = "0.6rem"
+buttonRadius = "0.5rem"
+headingFontSizes = ["2.15rem", "1.55rem", "1.2rem", "1.02rem", "0.92rem", "0.82rem"]
+headingFontWeights = [700, 600, 600, 600, 600, 600]
+metricValueFontSize = "1.85rem"
+showWidgetBorder = true
+dataframeHeaderBackgroundColor = "#313744"
+chartCategoricalColors = ["#7AB8F5", "#E8B04B", "#7CC79A", "#E8615C", "#B48CE0", "#5FC4C0", "#E0A25A"]
+
+[theme.sidebar]
+backgroundColor = "#252A34"
+secondaryBackgroundColor = "#2F3540"
+borderColor = "#3B4250"
+
+[client]
+toolbarMode = "minimal"

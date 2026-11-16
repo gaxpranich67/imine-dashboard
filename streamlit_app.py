@@ -46,7 +46,50 @@ REQUIRED = {
 }
 
 st.set_page_config(page_title='Imine Reaction Explorer', layout='wide')
-st.title('Imine Reaction Explorer')
+
+APP_CSS = '''<style>
+/* Layout */
+.block-container {padding-top: 2.4rem; padding-bottom: 2.5rem; max-width: 1440px;}
+/* Page header */
+.app-header {padding: 0.2rem 0 1.1rem; margin-bottom: 0.4rem; border-bottom: 1px solid rgba(127,127,127,0.2);}
+.app-header .overline {font-size: 0.72rem; font-weight: 600; letter-spacing: 0.14em; text-transform: uppercase; color: #7AB8F5;}
+.app-header h1 {font-size: 2.15rem; font-weight: 700; letter-spacing: -0.02em; line-height: 1.15; margin: 0.25rem 0 0.4rem; padding: 0;}
+.app-header p {margin: 0; font-size: 0.95rem; opacity: 0.72; max-width: 62rem;}
+.app-header .chips {display: flex; flex-wrap: wrap; gap: 0.4rem; margin-top: 0.85rem;}
+.app-header .chip {font-size: 0.78rem; padding: 0.2rem 0.65rem; border-radius: 999px;
+                   border: 1px solid rgba(127,127,127,0.28); background: rgba(127,127,127,0.08); white-space: nowrap;}
+.app-header .chip b {font-weight: 600; color: #8EC5FA;}
+/* Metric cards */
+[data-testid="stMetric"] {background: rgba(127,127,127,0.07); border: 1px solid rgba(127,127,127,0.18);
+                          border-radius: 0.75rem; padding: 0.75rem 1rem 0.7rem;}
+[data-testid="stMetricLabel"] p {font-size: 0.74rem; font-weight: 500; letter-spacing: 0.06em; text-transform: uppercase; opacity: 0.72;}
+[data-testid="stMetricValue"] {letter-spacing: -0.01em;}
+/* Tabs */
+.stTabs [data-baseweb="tab-list"] {gap: 0.15rem; border-bottom: 1px solid rgba(127,127,127,0.22);}
+.stTabs [data-baseweb="tab"] {padding: 0.55rem 0.85rem; border-radius: 0.5rem 0.5rem 0 0;}
+.stTabs [data-baseweb="tab"] p {font-size: 0.9rem; font-weight: 500;}
+.stTabs [data-baseweb="tab"]:hover {background: rgba(127,127,127,0.08);}
+.stTabs [aria-selected="true"] {background: rgba(122,184,245,0.10);}
+.stTabs [data-baseweb="tab-panel"] {padding-top: 1.1rem;}
+/* Headings and captions */
+.stMainBlockContainer h3 {letter-spacing: -0.01em; padding-top: 0.9rem;}
+[data-testid="stCaptionContainer"] {line-height: 1.5;}
+/* Sidebar */
+section[data-testid="stSidebar"] h2 {font-size: 1.15rem; letter-spacing: -0.01em;}
+section[data-testid="stSidebar"] h3 {font-size: 0.74rem; font-weight: 600; letter-spacing: 0.12em; text-transform: uppercase; opacity: 0.8;}
+section[data-testid="stSidebar"] [data-testid="stExpander"] summary p {font-weight: 500;}
+/* Expanders, tables, charts */
+[data-testid="stExpander"] details {border-radius: 0.65rem;}
+[data-testid="stExpander"] summary p {font-weight: 500;}
+[data-testid="stPlotlyChart"] {border: 1px solid rgba(127,127,127,0.14); border-radius: 0.75rem; padding: 0.35rem 0.4rem 0.1rem;}
+/* Small screens: clear Streamlit's top bar */
+@media (max-width: 640px) {.block-container {padding-top: 3.6rem;} .app-header h1 {font-size: 1.75rem;}}
+/* Footer */
+.app-footer {margin-top: 2.5rem; padding-top: 1rem; border-top: 1px solid rgba(127,127,127,0.2);
+             font-size: 0.78rem; opacity: 0.6; display: flex; flex-wrap: wrap; gap: 0.3rem 1.25rem;}
+</style>'''
+st.html(APP_CSS)
+header_box = st.container()
 
 @st.cache_data
 def read_csv(source):
@@ -202,8 +245,16 @@ data = data.copy()
 for column in ('temperature_C', 'time_min', 'conversion_percent'):
     data[column] = pd.to_numeric(data[column], errors='coerce')
 data = data.dropna(subset=list(REQUIRED))
-st.caption(f'{len(data)} imine-condensation measurements: {data.aldehyde_name.nunique()} aldehydes × {data.amine_name.nunique()} amines × '
-           f'{data.solvent.nunique()} solvents × {data.temperature_C.nunique()} temperatures × {data.time_min.nunique()} times.')
+chips = ''.join(f'<span class="chip"><b>{n}</b> {label}</span>' for n, label in (
+    (len(data), 'measurements'), (data.aldehyde_name.nunique(), 'aldehydes'), (data.amine_name.nunique(), 'amines'),
+    (data.solvent.nunique(), 'solvents'), (data.temperature_C.nunique(), 'temperatures'), (data.time_min.nunique(), 'time points')))
+header_box.html(f'''<div class="app-header">
+  <div class="overline">Physical organic chemistry · Imine condensation</div>
+  <h1>Imine Reaction Explorer</h1>
+  <p>{len(data)} imine-condensation measurements: {data.aldehyde_name.nunique()} aldehydes × {data.amine_name.nunique()} amines ×
+     {data.solvent.nunique()} solvents × {data.temperature_C.nunique()} temperatures × {data.time_min.nunique()} times.</p>
+  <div class="chips">{chips}</div>
+</div>''')
 
 SUBSCRIPTS = str.maketrans('0123456789', '₀₁₂₃₄₅₆₇₈₉')
 r_options = sorted(data.aldehyde_R_group.unique(), key=lambda r: (HAMMETT_SIGMA_P.get(r, 99), r))
@@ -300,9 +351,13 @@ def prediction_cv(frame, order):
 def show(fig, name, height=None):
     """Render a Plotly chart with a consistent look and a publication-quality download button."""
     fig.update_layout(margin=dict(l=10, r=10, b=10, t=max(50, fig.layout.margin.t or 0)), legend_title_text='',
-                      font=dict(size=13), **({'height': height} if height else {}))
-    fig.update_xaxes(gridcolor='rgba(127,127,127,0.18)', zeroline=False)
-    fig.update_yaxes(gridcolor='rgba(127,127,127,0.18)', zeroline=False)
+                      font=dict(family='Inter, sans-serif', size=13), legend=dict(font_size=12, bgcolor='rgba(0,0,0,0)'),
+                      hoverlabel=dict(font_family='Inter, sans-serif', font_size=12),
+                      **({'height': height} if height else {}))
+    axis_style = dict(gridcolor='rgba(127,127,127,0.16)', zeroline=False, showline=True, linecolor='rgba(127,127,127,0.4)',
+                      ticks='outside', tickcolor='rgba(127,127,127,0.4)', ticklen=4, title_font_size=13)
+    fig.update_xaxes(**axis_style)
+    fig.update_yaxes(**axis_style)
     st.plotly_chart(fig, width='stretch', config={'displaylogo': False, 'toImageButtonOptions': {
         'format': export_format, 'filename': name, 'scale': 3}})
 
@@ -526,16 +581,19 @@ with tab_p:
 
         show_gp = p_model != 'Direct GBM'
         show_gbm = p_model != 'Kinetic GP (recommended)'
-        m = st.columns(4)
+        m = st.columns(int(show_gp) + int(show_gbm) + 2)  # one card per shown result, no empty gaps
+        slot = iter(m)
         if show_gp:
-            m[0].metric(f'Conversion at {p_time:g} min', f'{centre[0, 0]:.1f}%', help='Kinetic GP prediction')
-            m[0].caption(f'95% interval {low[0, 0]:.1f}–{high[0, 0]:.1f}%')
+            gp_card = next(slot)
+            gp_card.metric(f'Conversion at {p_time:g} min', f'{centre[0, 0]:.1f}%', help='Kinetic GP prediction')
+            gp_card.caption(f'95% interval {low[0, 0]:.1f}–{high[0, 0]:.1f}%')
         if show_gbm:
-            (m[1] if show_gp else m[0]).metric(f'Direct GBM at {p_time:g} min', f'{gbm_at_t:.1f}%')
+            next(slot).metric(f'Direct GBM at {p_time:g} min', f'{gbm_at_t:.1f}%')
         t_target = float(time_to_reach(p_target / 100, k_pred, ORDER))
-        m[2].metric(f'Time to {p_target}%', f'{t_target:,.0f} min' if t_target < 1e5 else '> 10⁵ min', help='Kinetic GP + rate law')
-        m[3].metric('Predicted k_app', f'{k_pred:.3g} min⁻¹', help=f'Apparent Eₐ from the model ≈ {ea_pred:.0f} kJ/mol')
-        m[3].caption(f'Eₐ ≈ {ea_pred:.0f} kJ/mol · t½ ≈ {float(time_to_reach(0.5, k_pred, ORDER)):,.0f} min')
+        next(slot).metric(f'Time to {p_target}%', f'{t_target:,.0f} min' if t_target < 1e5 else '> 10⁵ min', help='Kinetic GP + rate law')
+        k_card = next(slot)
+        k_card.metric('Predicted k_app', f'{k_pred:.3g} min⁻¹', help=f'Apparent Eₐ from the model ≈ {ea_pred:.0f} kJ/mol')
+        k_card.caption(f'Eₐ ≈ {ea_pred:.0f} kJ/mol · t½ ≈ {float(time_to_reach(0.5, k_pred, ORDER)):,.0f} min')
 
         if issues:
             st.warning('Extrapolation: ' + '; '.join(issues) + '. Treat the numbers as a hypothesis to test, not a result.')
@@ -1140,3 +1198,8 @@ Every chart has a camera button (top right) that saves it as SVG or PNG at 3× r
 - A high conversion at 80 minutes does not prove that a condition is fast at 20 minutes. Inspect the time course before choosing a lab condition.
 - Do not extrapolate to untested substrates, times, temperatures or solvents without further experiments.
 ''')
+
+st.html('<div class="app-footer"><span>Imine Reaction Explorer</span>'
+        '<span>σ constants: Hansch, Leo &amp; Taft, Chem. Rev. 1991, 91, 165</span>'
+        '<span>Built with Streamlit, Plotly, RDKit and scikit-learn</span>'
+        '<span>Descriptive and predictive summaries; verify before planning experiments</span></div>')
