@@ -255,14 +255,29 @@ with tab0:
 
 with tab1:
     st.subheader('How conversion changes over time')
-    st.caption('Each line averages the selected aldehydes and amines at a fixed temperature and solvent. Use the sidebar to isolate a specific reaction.')
+    st.caption('One panel per solvent; each line is one temperature, averaged over the selected aldehydes and amines. '
+               'Use the sidebar to isolate a specific reaction.')
     traces = filtered.groupby(['time_min', 'temperature_C', 'solvent'], as_index=False)['conversion_percent'].mean()
-    traces['Condition'] = traces.apply(lambda row: f'{row["solvent"]} · {row["temperature_C"]:g} °C', axis=1)
-    fig = px.line(traces, x='time_min', y='conversion_percent', color='Condition', markers=True,
-                  labels={'time_min': 'Time (min)', 'conversion_percent': 'Mean conversion (%)'},
-                  hover_data={'temperature_C': True, 'solvent': True, 'Condition': False})
-    fig.update_yaxes(range=[0, 105])
+    temp_values = sorted(traces.temperature_C.unique())
+    traces['Temperature'] = traces.temperature_C.map(lambda t: f'{t:g} °C')
+    temp_labels = [f'{t:g} °C' for t in temp_values]
+    # Cool-to-warm colours, so colder runs read as blue and hotter runs as red.
+    warm = ['#5B9BF0', '#E8B04B', '#E8615C'] if len(temp_values) <= 3 else \
+        px.colors.sample_colorscale('Turbo', [i / (len(temp_values) - 1) for i in range(len(temp_values))])
+    fig = px.line(traces, x='time_min', y='conversion_percent', color='Temperature', facet_col='solvent',
+                  markers=True, category_orders={'Temperature': temp_labels},
+                  color_discrete_sequence=warm[-len(temp_values):] if len(temp_values) < 3 else warm,
+                  labels={'time_min': 'Time (min)', 'conversion_percent': 'Mean conversion (%)', 'solvent': 'Solvent'},
+                  hover_data={'solvent': False, 'conversion_percent': ':.1f'})
+    fig.for_each_annotation(lambda a: a.update(text=f'<b>{a.text.split("=")[-1]}</b>', font_size=14))
+    fig.update_traces(line_width=3, marker_size=9)
+    top = traces.conversion_percent.max()
+    fig.update_yaxes(range=[0, min(105, (int(top // 10) + 2) * 10)], gridcolor='rgba(127,127,127,0.2)')
+    fig.update_xaxes(tickvals=sorted(traces.time_min.unique()))
+    fig.update_layout(height=460, legend=dict(orientation='h', yanchor='bottom', y=1.1, xanchor='left', x=0), margin=dict(t=90),
+                      hovermode='x unified')
     st.plotly_chart(fig, width='stretch')
+    st.caption('The y-axis starts at 0 and is scaled to the data shown, so the lines are easier to tell apart.')
     st.caption('Only sampled time points are connected; lines do not establish a kinetic model.')
 
 with tab2:
