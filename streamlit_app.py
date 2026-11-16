@@ -1,4 +1,5 @@
 import base64
+import re
 from html import escape
 from pathlib import Path
 
@@ -65,11 +66,21 @@ SCHEME_CSS = '''<style>
 .scheme .op {font-size:1.8rem; opacity:0.85;}
 .scheme .arrow {display:flex; flex-direction:column; align-items:center; min-width:7rem; font-size:0.8rem; opacity:0.9;}
 .scheme .arrow b {font-size:2.4rem; line-height:1; font-weight:400;}
-.gallery {display:flex; flex-wrap:wrap; gap:0.75rem; margin-bottom:1rem;}
-.gallery figure {margin:0; padding:0.5rem 0.75rem; border-radius:0.5rem; background:rgba(127,127,127,0.1);
-                 display:flex; flex-direction:column; align-items:center; justify-content:flex-end; min-width:9rem;}
-.gallery figcaption {font-size:0.82rem; text-align:center;}
+.substrates {overflow-x:auto; margin-bottom:1.5rem;}
+.gallery {display:grid; grid-template-columns:repeat(7, minmax(6.5rem, 1fr)); gap:0.5rem 0.5rem;}
+.gallery figure {margin:0; padding:0.5rem 0.25rem 0.4rem; border-radius:0.5rem; background:rgba(127,127,127,0.1);
+                 display:flex; flex-direction:column; align-items:center; justify-content:flex-end;}
+.gallery svg {width:100%; height:auto; display:block;}
+.gallery figcaption {font-size:0.8rem; line-height:1.3; text-align:center; overflow-wrap:anywhere;}
 .gallery small {opacity:0.75;}
+.trend {margin:0.2rem 0.25rem 0;}
+.trend .bar {position:relative; height:6px; margin-right:14px; border-radius:3px 0 0 3px;
+             background:linear-gradient(90deg, var(--from), var(--to));}
+.trend .bar::after {content:''; position:absolute; right:-14px; top:-6px; border-left:14px solid var(--to);
+                    border-top:9px solid transparent; border-bottom:9px solid transparent;}
+.trend .labels {display:flex; justify-content:space-between; gap:1rem; font-size:0.8rem; margin-top:0.35rem;}
+.trend .labels span:nth-child(2) {opacity:0.75; text-align:center;}
+.trend .labels span:first-child, .trend .labels span:last-child {white-space:nowrap;}
 </style>'''
 
 
@@ -86,11 +97,20 @@ def scheme(parts, bond_length=26):
     st.markdown(SCHEME_CSS + '<div class="scheme">' + ''.join(html) + '</div>', unsafe_allow_html=True)
 
 
-def gallery(items):
-    """items: (smiles, title, subtitle)."""
-    cards = ''.join(f'<figure>{structure_svg(smiles, 22)}<figcaption>{escape(title)}<br><small>{escape(sub)}</small></figcaption></figure>'
-                    for smiles, title, sub in items)
-    st.markdown(SCHEME_CSS + f'<div class="gallery">{cards}</div>', unsafe_allow_html=True)
+def gallery(items, trend):
+    """items: (smiles, title, subtitle, tooltip); trend: (left label, middle label, right label, from colour, to colour)."""
+    svgs = [structure_svg(item[0], 20) for item in items]
+    widths = [float(m.group(1)) if (m := re.search(r"width='([\d.]+)px'", svg)) else 100.0 for svg in svgs]
+    widest = max(widths)
+    # Same scale for every card in the row: each drawing gets the share of card width its natural size implies.
+    cards = ''.join(f'<figure title="{escape(tip)}"><div style="width:{96 * w / widest:.0f}%; max-width:{w:.0f}px">{svg}</div>'
+                    f'<figcaption><b>{escape(title)}</b><br><small>{escape(sub)}</small></figcaption></figure>'
+                    for svg, w, (_, title, sub, tip) in zip(svgs, widths, items))
+    left, middle, right, start, end = trend
+    # Both substrate rows share a 7-column grid, so cards are the same size; the arrow spans the occupied columns.
+    arrow = (f'<div class="trend" style="--from:{start}; --to:{end}; grid-column:1 / span {len(items)}"><div class="bar"></div><div class="labels">'
+             f'<span>{escape(left)}</span><span>{escape(middle)}</span><span>{escape(right)}</span></div></div>')
+    st.markdown(SCHEME_CSS + f'<div class="substrates"><div class="gallery">{cards}{arrow}</div></div>', unsafe_allow_html=True)
 
 if CSV_PATH.exists():
     data = read_csv(CSV_PATH)
@@ -111,12 +131,55 @@ for column in ('temperature_C', 'time_min', 'conversion_percent'):
     data[column] = pd.to_numeric(data[column], errors='coerce')
 data = data.dropna(subset=list(REQUIRED))
 
-st.sidebar.header('Filter experiments')
-aldehydes = st.sidebar.multiselect('Aldehydes', sorted(data.aldehyde_name.unique()), default=sorted(data.aldehyde_name.unique()))
-amines = st.sidebar.multiselect('Amines', sorted(data.amine_name.unique()), default=sorted(data.amine_name.unique()))
-solvents = st.sidebar.multiselect('Solvents', sorted(data.solvent.unique()), default=sorted(data.solvent.unique()))
-temperatures = st.sidebar.multiselect('Temperature (°C)', sorted(data.temperature_C.unique()), default=sorted(data.temperature_C.unique()))
-times = st.sidebar.multiselect('Time (min)', sorted(data.time_min.unique()), default=sorted(data.time_min.unique()))
+SUBSCRIPTS = str.maketrans('0123456789', '₀₁₂₃₄₅₆₇₈₉')
+r_options = sorted(data.aldehyde_R_group.unique(), key=lambda r: (HAMMETT_SIGMA_P.get(r, 99), r))
+amine_options = sorted(data.amine_name.unique(), key=lambda n: (list(AMINE_NOTES).index(n) if n in AMINE_NOTES else 99, n))
+FILTERS = {  # session key: (label, options, format, help)
+    'f_r': ('Aldehyde substituent (para-R)', r_options, lambda r: r.translate(SUBSCRIPTS),
+            'Ordered from electron-donating (left) to electron-withdrawing (right).'),
+    'f_amine': ('Amine', amine_options, str, 'Ordered by increasing steric bulk next to nitrogen.'),
+    'f_solvent': ('Solvent', sorted(data.solvent.unique()), str, None),
+    'f_temp': ('Temperature', sorted(data.temperature_C.unique()), lambda t: f'{t:g} °C', None),
+    'f_time': ('Reaction time', sorted(data.time_min.unique()), lambda t: f'{t:g} min', None),
+}
+
+
+def reset_filters():
+    for key, (_, options, _, _) in FILTERS.items():
+        st.session_state[key] = list(options)
+
+
+def fair_comparison():
+    """Keep all reactants but fix one solvent, the middle temperature and the longest time."""
+    reset_filters()
+    for key, pick in (('f_solvent', 0), ('f_temp', len(FILTERS['f_temp'][1]) // 2), ('f_time', -1)):
+        st.session_state[key] = [FILTERS[key][1][pick]]
+
+
+for key, (_, options, _, _) in FILTERS.items():
+    st.session_state.setdefault(key, list(options))
+
+with st.sidebar:
+    st.header('Filters')
+    st.caption('Click a button to include or exclude it. Highlighted = included. Every tab uses these filters.')
+    b1, b2 = st.columns(2)
+    b1.button('Show all', on_click=reset_filters, width='stretch')
+    b2.button('Fair test', on_click=fair_comparison, width='stretch',
+              help='One solvent, one temperature and one time, so reactants are compared under identical conditions.')
+    selections = {}
+    for group, keys in (('Reactants', ('f_r', 'f_amine')), ('Conditions', ('f_solvent', 'f_temp', 'f_time'))):
+        st.subheader(group, divider='gray')
+        for key in keys:
+            label, options, fmt, help_text = FILTERS[key]
+            selections[key] = st.pills(label, options, selection_mode='multi', format_func=fmt, key=key, help=help_text)
+            if not selections[key]:
+                st.caption(':orange[Nothing selected, so no data. Pick at least one.]')
+
+aldehydes = sorted(data[data.aldehyde_R_group.isin(selections['f_r'])].aldehyde_name.unique())
+amines = [a for a in amine_options if a in selections['f_amine']]
+solvents = selections['f_solvent']
+temperatures = sorted(selections['f_temp'])
+times = sorted(selections['f_time'])
 
 filtered = data[
     data.aldehyde_name.isin(aldehydes)
@@ -126,7 +189,7 @@ filtered = data[
     & data.time_min.isin(times)
 ].copy()
 if filtered.empty:
-    st.warning('No measurements match these filters. Select at least one value in each filter.')
+    st.warning('No measurements match these filters. Select at least one button in each sidebar group, or click Show all.')
     st.stop()
 
 st.caption(f'{len(filtered)} measurements shown out of {len(data)}. Summaries are descriptive; they are not predictions for unmeasured conditions.')
@@ -174,17 +237,21 @@ with tab0:
                 column.metric(f'{point.time_min:g} min', f'{point.conversion_percent:.1f}%')
 
         st.subheader('Substrates')
-        st.markdown('**Aldehydes**, from electron-donating to electron-withdrawing (Hammett σp)')
+        st.markdown('**Aldehydes**: para-substituted benzaldehydes, 4-R-C₆H₄-CHO (hover a card for the name)')
         alds = data.drop_duplicates('aldehyde_name')
         alds = alds.assign(order=alds.aldehyde_R_group.map({r: i for i, r in enumerate(R_GROUP_ORDER)})).sort_values('order')
-        gallery([(r.aldehyde_SMILES, r.aldehyde_name,
-                  f'R = {r.aldehyde_R_group}' + (f', σp = {HAMMETT_SIGMA_P[r.aldehyde_R_group]:+.2f}'
-                                                 if r.aldehyde_R_group in HAMMETT_SIGMA_P else ''))
-                 for r in alds.itertuples()])
-        st.markdown('**Amines**, increasing steric bulk at the carbon next to nitrogen')
+        gallery([(r.aldehyde_SMILES, f'R = {r.aldehyde_R_group.translate(SUBSCRIPTS)}',
+                  f'σp {HAMMETT_SIGMA_P[r.aldehyde_R_group]:+.2f}'.replace('-', '−')
+                  if r.aldehyde_R_group in HAMMETT_SIGMA_P else '', r.aldehyde_name)
+                 for r in alds.itertuples()],
+                ('electron-donating', 'more electrophilic C=O →', 'electron-withdrawing',
+                 '#5B9BF0', '#E8615C'))
+        st.markdown('**Amines** (butylamine isomers)')
         amine_rows = data.drop_duplicates('amine_name').set_index('amine_name')
-        gallery([(amine_rows.loc[a, 'amine_SMILES'], a, AMINE_NOTES.get(a, ''))
-                 for a in sorted(amine_rows.index, key=lambda n: (list(AMINE_NOTES).index(n) if n in AMINE_NOTES else 99, n))])
+        gallery([(amine_rows.loc[a, 'amine_SMILES'], a, AMINE_NOTES.get(a, ''), a)
+                 for a in sorted(amine_rows.index, key=lambda n: (list(AMINE_NOTES).index(n) if n in AMINE_NOTES else 99, n))],
+                ('less hindered', 'bulkier next to N →', 'more hindered',
+                 '#7CC79A', '#E0A25A'))
 
 with tab1:
     st.subheader('How conversion changes over time')
