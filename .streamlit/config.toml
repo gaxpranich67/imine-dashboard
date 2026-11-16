@@ -1,0 +1,7 @@
+[theme]
+# Soft dark theme: slate grey, not black
+base = "dark"
+primaryColor = "#7AB8F5"
+backgroundColor = "#2B303B"
+secondaryBackgroundColor = "#363C49"
+textColor = "#E4E7EC"
