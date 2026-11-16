@@ -12,8 +12,15 @@ from rdkit import Chem
 from rdkit.Chem import Crippen, Descriptors, rdMolDescriptors
 from rdkit.Chem.Draw import rdMolDraw2D
 
+try:
+    from streamlit_ketcher import st_ketcher
+    HAS_KETCHER = True
+except ImportError:  # drawing is optional; SMILES and name entry still work
+    HAS_KETCHER = False
+
 from ml import (DESCRIPTORS, add_descriptors, cross_validate, predict_conversion_gbm, predict_conversion_gp,
                 predict_ln_k, train_direct_gbm, train_kinetic_gp)
+from structures import describe_aldehyde, describe_amine, imine_product, parse as parse_smiles
 from analysis import R_GAS, activation_parameters, conversion, fit_kinetics, linearised, model_comparison, ols, time_to_reach
 
 CSV_PATH = Path(__file__).with_name('imine_condensation_dataset_for_students.csv')
@@ -65,11 +72,59 @@ def structure_svg(smiles, bond_length=26):
     options.minFontSize = 14
     options.padding = 0.12
     # Heteroatom colours chosen to read on both light and dark backgrounds.
-    options.updateAtomPalette({0: (0, 0, 0), 7: (0.35, 0.58, 0.98), 8: (0.93, 0.36, 0.34), 9: (0.30, 0.74, 0.45), 17: (0.30, 0.74, 0.45)})
+    options.updateAtomPalette({0: (0, 0, 0), 7: (0.35, 0.58, 0.98), 8: (0.93, 0.36, 0.34), 9: (0.30, 0.74, 0.45), 17: (0.30, 0.74, 0.45),
+                                16: (0.90, 0.76, 0.29), 35: (0.85, 0.53, 0.31), 53: (0.69, 0.49, 0.86)})
     rdMolDraw2D.PrepareAndDrawMolecule(drawer, mol)
     drawer.FinishDrawing()
     svg = drawer.GetDrawingText()
     return svg[svg.index('<svg'):].replace('#000000', 'currentColor').replace('\n', ' ')
+
+
+def parse_structure(smiles):
+    return parse_smiles(smiles)
+
+
+def structure_figure(smiles, caption):
+    return SCHEME_CSS + f'<div class="scheme"><figure>{structure_svg(smiles, 24)}<figcaption>{escape(caption)}</figcaption></figure></div>'
+
+
+@st.cache_data(show_spinner='Looking up the name on PubChem…', ttl=86400)
+def pubchem_smiles(name):
+    """SMILES for a compound name from PubChem, or an error message."""
+    import json
+    import urllib.parse
+    import urllib.request
+    url = ('https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/' + urllib.parse.quote(name.strip())
+           + '/property/IsomericSMILES,CanonicalSMILES/JSON')
+    try:
+        with urllib.request.urlopen(url, timeout=10) as response:
+            props = json.load(response)['PropertyTable']['Properties'][0]
+    except Exception as error:
+        return None, f'PubChem lookup failed ({error.__class__.__name__}). Check the name or type SMILES instead.'
+    for key in ('IsomericSMILES', 'SMILES', 'CanonicalSMILES', 'ConnectivitySMILES'):
+        if props.get(key):
+            return props[key], None
+    return None, 'PubChem returned no SMILES for that name.'
+
+
+def structure_input(role, default_smiles, default_name):
+    """Let the user give a structure by SMILES, drawing or name. Returns a SMILES string (may be empty)."""
+    modes = ['Type SMILES', 'Draw', 'Look up name'] if HAS_KETCHER else ['Type SMILES', 'Look up name']
+    mode = st.radio(f'Enter the {role} by', modes, horizontal=True, key=f'mode_{role}')
+    if mode == 'Type SMILES':
+        return st.text_input('SMILES', default_smiles, key=f'smiles_{role}', help='e.g. O=Cc1ccc(Br)cc1 or NCC(C)C')
+    if mode == 'Draw':
+        st.caption('Draw the structure, then press **Apply** under the editor.')
+        return st_ketcher(default_smiles, height=380, key=f'ketcher_{role}') or ''
+    name = st.text_input('Compound name', default_name, key=f'name_{role}')
+    if not name.strip():
+        return ''
+    smiles, error = pubchem_smiles(name)
+    if error:
+        st.warning(error)
+        return ''
+    st.caption(f'PubChem: {smiles}')
+    return smiles
 
 
 SCHEME_CSS = '''<style>
@@ -369,31 +424,65 @@ with tab_p:
     gp_model, gbm_model, kin_desc = prediction_models(data, ORDER)
     T_LO, T_HI = float(data.temperature_C.min()), float(data.temperature_C.max())
     TIME_HI = float(data.time_min.max())
-    CUSTOM = 'Custom…'
+    CUSTOM = 'Custom structure…'
+    known_ald_smiles = {Chem.CanonSmiles(v): k for k, v in data.drop_duplicates('aldehyde_name')
+                        .set_index('aldehyde_name').aldehyde_SMILES.items()} if SMILES_COLUMNS.issubset(data.columns) else {}
+    known_amine_smiles = {Chem.CanonSmiles(v): k for k, v in data.drop_duplicates('amine_name')
+                          .set_index('amine_name').amine_SMILES.items()} if SMILES_COLUMNS.issubset(data.columns) else {}
 
     i1, i2 = st.columns(2)
     with i1:
         ald_known = sorted(R_OF.items(), key=lambda kv: HAMMETT_SIGMA_P.get(kv[1], 99))
         ald_pick = st.selectbox('Aldehyde', [a for a, _ in ald_known] + [CUSTOM], index=3 if len(ald_known) > 3 else 0, key='p_ald')
         if ald_pick == CUSTOM:
-            c1, c2, c3 = st.columns(3)
-            p_label = c1.text_input('para-R label', 'Br', key='p_label')
-            p_sp = c2.number_input('σp', -1.0, 1.2, 0.23, 0.01, key='p_sp', help='Hammett σp of the para-substituent (e.g. Br +0.23, F +0.06, CN +0.66).')
-            p_spp = c3.number_input('σp⁺', -2.0, 1.2, 0.15, 0.01, key='p_spp', help='Brown–Okamoto σp⁺ (e.g. Br +0.15, F −0.07, CN +0.66).')
-            p_r = None
+            ald_smiles = structure_input('aldehyde', 'O=Cc1ccc(Br)cc1', '4-bromobenzaldehyde')
+            info = describe_aldehyde(ald_smiles) if ald_smiles else {'ok': False, 'messages': ['Enter a structure.']}
+            if ald_smiles and parse_structure(ald_smiles) is not None:
+                st.markdown(structure_figure(ald_smiles, info.get('label') or ''), unsafe_allow_html=True)
+            for message in info['messages']:
+                (st.caption if info['ok'] else st.warning)(message)
+            if info.get('substituents'):
+                st.caption(' · '.join(f'{pos}-{lab}: σ {sig:+.2f} / σ⁺ {sigp:+.2f}' if sig is not None else f'{pos}-{lab}: no value'
+                                      for pos, lab, sig, sigp in info['substituents']).replace('-0', '−0'))
+            c1, c2 = st.columns(2)
+            stamp = abs(hash(ald_smiles)) % 10 ** 8
+            p_sp = c1.number_input('Σσ (σp / σm)', -2.0, 2.0, float(info.get('sigma_p', 0.0)), 0.01, key=f'p_sp_{stamp}',
+                                   help='Filled in from the structure when every substituent is recognised; edit to override.')
+            p_spp = c2.number_input('Σσ⁺', -3.0, 2.0, float(info.get('sigma_p_plus', 0.0)), 0.01, key=f'p_spp_{stamp}',
+                                    help='σp⁺ for para, σm for meta substituents.')
+            ald_match = known_ald_smiles.get(Chem.CanonSmiles(ald_smiles)) if parse_structure(ald_smiles) is not None else None
+            p_r = R_OF[ald_match] if ald_match else None
+            p_label = info.get('label') or 'custom'
+            ald_name = ald_match or 'custom aldehyde'
+            ald_valid, ald_manual = bool(info.get('scaffold')), not info.get('ok')
         else:
             p_r = R_OF[ald_pick]
+            ald_name = ald_pick
+            ald_smiles = data.loc[data.aldehyde_name == ald_pick, 'aldehyde_SMILES'].iloc[0] if SMILES_COLUMNS.issubset(data.columns) else None
+            ald_valid, ald_manual = True, False
             p_label, p_sp, p_spp = sub_label(p_r), HAMMETT_SIGMA_P[p_r], HAMMETT_SIGMA_P_PLUS[p_r]
             st.caption(f'R = {p_label} · σp {p_sp:+.2f} · σp⁺ {p_spp:+.2f}'.replace('-', '−'))
     with i2:
         amine_pick = st.selectbox('Amine', [a for a in amine_options if a in TAFT_ES] + [CUSTOM], key='p_amine')
         if amine_pick == CUSTOM:
-            c1, c2 = st.columns(2)
-            p_amine_label = c1.text_input('Amine name', 'isobutylamine', key='p_amine_label')
-            p_es = c2.number_input('Taft Eₛ of N-alkyl group', -3.0, 0.5, -0.93, 0.01, key='p_es',
-                                   help='More negative = bulkier. e.g. ethyl −0.07, isopropyl −0.47, isobutyl −0.93, cyclohexyl −0.79.')
+            amine_smiles = structure_input('amine', 'NCC(C)C', 'isobutylamine')
+            info = describe_amine(amine_smiles) if amine_smiles else {'ok': False, 'messages': ['Enter a structure.']}
+            if amine_smiles and parse_structure(amine_smiles) is not None:
+                st.markdown(structure_figure(amine_smiles, info.get('label') or ''), unsafe_allow_html=True)
+            for message in info['messages']:
+                (st.caption if info['ok'] else st.warning)(message)
+            stamp = abs(hash(amine_smiles)) % 10 ** 8
+            p_es = st.number_input('Taft Eₛ of the N-alkyl group', -3.0, 1.0, float(info.get('taft_Es', -0.5)), 0.01, key=f'p_es_{stamp}',
+                                   help='Filled in from the structure when the alkyl group is recognised; edit to override. More negative = bulkier.')
+            amine_match = known_amine_smiles.get(Chem.CanonSmiles(amine_smiles)) if parse_structure(amine_smiles) is not None else None
+            amine_name = amine_match or (info.get('label', 'custom') + 'amine' if info.get('ok') else 'custom amine')
+            amine_valid, amine_manual = bool(info.get('scaffold')), not info.get('ok')
         else:
-            p_amine_label, p_es = amine_pick, TAFT_ES[amine_pick]
+            amine_match = amine_pick
+            amine_name = amine_pick
+            amine_smiles = data.loc[data.amine_name == amine_pick, 'amine_SMILES'].iloc[0] if SMILES_COLUMNS.issubset(data.columns) else None
+            p_es = TAFT_ES[amine_pick]
+            amine_valid, amine_manual = True, False
             st.caption(f'Taft Eₛ {p_es:+.2f}'.replace('-', '−'))
     c1, c2, c3 = st.columns(3)
     p_solvent = c1.selectbox('Solvent', sorted(data.solvent.unique()), key='p_solvent',
@@ -407,116 +496,137 @@ with tab_p:
                        help='Kinetic GP: Gaussian process on ln k + rate law, with 95% interval. Direct GBM: gradient-boosted trees on conversion.')
     p_target = c2.slider('Target conversion for "time to" (%)', 10, 99, 90, key='p_target')
 
-    feat = np.array([[p_sp, p_spp, p_es, 1.0 if p_solvent.upper() == 'MTBE' else 0.0, 1000 / (p_temp + 273.15)]])
-    centre, low, high, ln_k, ln_k_sd = predict_conversion_gp(gp_model, feat, [p_time], ORDER)
-    k_pred = float(np.exp(ln_k[0]))
-    gbm_at_t = float(predict_conversion_gbm(gbm_model, feat, [p_time])[0, 0])
-    eps = 2.5
-    lk_lo, _ = predict_ln_k(gp_model, np.array([[*feat[0, :4], 1000 / (p_temp - eps + 273.15)]]))
-    lk_hi, _ = predict_ln_k(gp_model, np.array([[*feat[0, :4], 1000 / (p_temp + eps + 273.15)]]))
-    ea_pred = -R_GAS * (lk_hi[0] - lk_lo[0]) / (1 / (p_temp + eps + 273.15) - 1 / (p_temp - eps + 273.15)) / 1000
-
-    # Applicability domain
-    issues = []
-    if not T_LO <= p_temp <= T_HI:
-        issues.append(f'temperature {p_temp:g} °C is outside the measured {T_LO:g}–{T_HI:g} °C')
-    if p_time > TIME_HI:
-        issues.append(f'time {p_time:g} min is beyond the longest measured time ({TIME_HI:g} min)')
-    if not min(HAMMETT_SIGMA_P.values()) <= p_sp <= max(HAMMETT_SIGMA_P.values()):
-        issues.append('σp is outside the range of the training aldehydes')
-    if not min(HAMMETT_SIGMA_P_PLUS.values()) <= p_spp <= max(HAMMETT_SIGMA_P_PLUS.values()):
-        issues.append('σp⁺ is outside the range of the training aldehydes')
-    if not min(TAFT_ES.values()) <= p_es <= max(TAFT_ES.values()):
-        issues.append('Eₛ is outside the range of the training amines')
-    novel = ald_pick == CUSTOM or amine_pick == CUSTOM
-
-    show_gp = p_model != 'Direct GBM'
-    show_gbm = p_model != 'Kinetic GP (recommended)'
-    m = st.columns(4)
-    if show_gp:
-        m[0].metric(f'Conversion at {p_time:g} min', f'{centre[0, 0]:.1f}%', help='Kinetic GP prediction')
-        m[0].caption(f'95% interval {low[0, 0]:.1f}–{high[0, 0]:.1f}%')
-    if show_gbm:
-        (m[1] if show_gp else m[0]).metric(f'Direct GBM at {p_time:g} min', f'{gbm_at_t:.1f}%')
-    t_target = float(time_to_reach(p_target / 100, k_pred, ORDER))
-    m[2].metric(f'Time to {p_target}%', f'{t_target:,.0f} min' if t_target < 1e5 else '> 10⁵ min', help='Kinetic GP + rate law')
-    m[3].metric('Predicted k_app', f'{k_pred:.3g} min⁻¹', help=f'Apparent Eₐ from the model ≈ {ea_pred:.0f} kJ/mol')
-    m[3].caption(f'Eₐ ≈ {ea_pred:.0f} kJ/mol · t½ ≈ {float(time_to_reach(0.5, k_pred, ORDER)):,.0f} min')
-
-    if issues:
-        st.warning('Extrapolation: ' + '; '.join(issues) + '. Treat the numbers as a hypothesis to test, not a result.')
-    elif novel:
-        st.info('Inside the descriptor range, but this reactant was not measured. Leave-one-aldehyde-out validation suggests '
-                'typical errors of about ±10–15 percentage points for a new substrate.')
+    inputs_ok = ald_valid and amine_valid
+    if not inputs_ok:
+        st.info('Enter a valid aryl aldehyde (CHO on a benzene ring) and a primary alkylamine to get a prediction.')
     else:
-        st.success('Inside the measured domain. Cross-validated error for new conditions is well under 1 percentage point.')
+        feat = np.array([[p_sp, p_spp, p_es, 1.0 if p_solvent.upper() == 'MTBE' else 0.0, 1000 / (p_temp + 273.15)]])
+        centre, low, high, ln_k, ln_k_sd = predict_conversion_gp(gp_model, feat, [p_time], ORDER)
+        k_pred = float(np.exp(ln_k[0]))
+        gbm_at_t = float(predict_conversion_gbm(gbm_model, feat, [p_time])[0, 0])
+        eps = 2.5
+        lk_lo, _ = predict_ln_k(gp_model, np.array([[*feat[0, :4], 1000 / (p_temp - eps + 273.15)]]))
+        lk_hi, _ = predict_ln_k(gp_model, np.array([[*feat[0, :4], 1000 / (p_temp + eps + 273.15)]]))
+        ea_pred = -R_GAS * (lk_hi[0] - lk_lo[0]) / (1 / (p_temp + eps + 273.15) - 1 / (p_temp - eps + 273.15)) / 1000
 
-    if p_r is not None and amine_pick != CUSTOM and SMILES_COLUMNS.issubset(data.columns):
-        row = data[(data.aldehyde_name == ald_pick) & (data.amine_name == amine_pick)].iloc[0]
-        scheme([('mol', row.aldehyde_SMILES, ald_pick), ('op', '+'), ('mol', row.amine_SMILES, amine_pick),
-                ('arrow', f'{p_solvent}, {p_temp:g} °C', f'{p_time:g} min · predicted {centre[0, 0]:.0f}%'),
-                ('mol', row.imine_SMILES, 'imine product'), ('op', '+'), ('mol', 'O', 'water')])
+        # Applicability domain
+        issues = []
+        if not T_LO <= p_temp <= T_HI:
+            issues.append(f'temperature {p_temp:g} °C is outside the measured {T_LO:g}–{T_HI:g} °C')
+        if p_time > TIME_HI:
+            issues.append(f'time {p_time:g} min is beyond the longest measured time ({TIME_HI:g} min)')
+        if not min(HAMMETT_SIGMA_P.values()) <= p_sp <= max(HAMMETT_SIGMA_P.values()):
+            issues.append('σp is outside the range of the training aldehydes')
+        if not min(HAMMETT_SIGMA_P_PLUS.values()) <= p_spp <= max(HAMMETT_SIGMA_P_PLUS.values()):
+            issues.append('σp⁺ is outside the range of the training aldehydes')
+        if not min(TAFT_ES.values()) <= p_es <= max(TAFT_ES.values()):
+            issues.append('Eₛ is outside the range of the training amines')
+        measured_pair = p_r is not None and amine_match in TAFT_ES
+        novel = not measured_pair
 
-    t_grid = np.linspace(0, max(p_time, TIME_HI) * 1.15, 150)
-    fig = go.Figure()
-    if show_gp:
-        c_mid, c_lo, c_hi, _, _ = predict_conversion_gp(gp_model, feat, t_grid, ORDER)
-        fig.add_scatter(x=np.r_[t_grid, t_grid[::-1]], y=np.r_[c_hi[0], c_lo[0][::-1]], fill='toself', line=dict(width=0),
-                        fillcolor='rgba(122,184,245,0.22)', name='GP 95% interval', hoverinfo='skip')
-        fig.add_scatter(x=t_grid, y=c_mid[0], mode='lines', line=dict(color='#7AB8F5', width=3), name='Kinetic GP')
-    if show_gbm:
-        fig.add_scatter(x=t_grid, y=predict_conversion_gbm(gbm_model, feat, t_grid)[0], mode='lines',
-                        line=dict(color='#E8B04B', width=2, dash='dash'), name='Direct GBM')
-    if p_r is not None and amine_pick != CUSTOM:
-        measured = data[(data.aldehyde_name == ald_pick) & (data.amine_name == amine_pick) & (data.solvent == p_solvent)
-                        & (data.temperature_C == p_temp)]
-        if not measured.empty:
-            fig.add_scatter(x=measured.time_min, y=measured.conversion_percent, mode='markers', name='Measured',
-                            marker=dict(size=11, color='#E8615C', symbol='diamond'))
-    fig.add_vrect(x0=TIME_HI, x1=t_grid.max(), fillcolor='rgba(127,127,127,0.12)', line_width=0)
-    fig.add_vline(x=p_time, line_dash='dot', line_color='gray')
-    fig.update_layout(xaxis_title='Time (min)', yaxis_title='Conversion (%)', hovermode='x unified',
-                      legend=dict(orientation='h', yanchor='bottom', y=1.02, x=0), margin=dict(t=80))
-    fig.update_yaxes(range=[0, 102])
-    a, b = st.columns(2)
-    with a:
-        st.markdown('**Predicted time course**')
-        show(fig, 'predicted_time_course', height=380)
-        st.caption('Grey band: beyond the longest measured time.')
-    with b:
-        st.markdown(f'**Temperature response at {p_time:g} min**')
-        temp_grid = np.linspace(0, 60, 61)
-        feats = np.column_stack([np.repeat(feat[:, :4], len(temp_grid), axis=0), 1000 / (temp_grid + 273.15)])
+        show_gp = p_model != 'Direct GBM'
+        show_gbm = p_model != 'Kinetic GP (recommended)'
+        m = st.columns(4)
+        if show_gp:
+            m[0].metric(f'Conversion at {p_time:g} min', f'{centre[0, 0]:.1f}%', help='Kinetic GP prediction')
+            m[0].caption(f'95% interval {low[0, 0]:.1f}–{high[0, 0]:.1f}%')
+        if show_gbm:
+            (m[1] if show_gp else m[0]).metric(f'Direct GBM at {p_time:g} min', f'{gbm_at_t:.1f}%')
+        t_target = float(time_to_reach(p_target / 100, k_pred, ORDER))
+        m[2].metric(f'Time to {p_target}%', f'{t_target:,.0f} min' if t_target < 1e5 else '> 10⁵ min', help='Kinetic GP + rate law')
+        m[3].metric('Predicted k_app', f'{k_pred:.3g} min⁻¹', help=f'Apparent Eₐ from the model ≈ {ea_pred:.0f} kJ/mol')
+        m[3].caption(f'Eₐ ≈ {ea_pred:.0f} kJ/mol · t½ ≈ {float(time_to_reach(0.5, k_pred, ORDER)):,.0f} min')
+
+        if issues:
+            st.warning('Extrapolation: ' + '; '.join(issues) + '. Treat the numbers as a hypothesis to test, not a result.')
+        elif novel:
+            manual = ' Some descriptors were entered by hand, so check them.' if ald_manual or amine_manual else ''
+            st.info('Inside the descriptor range, but this reactant was not measured. Leave-one-aldehyde-out validation suggests '
+                    'typical errors of about ±10–15 percentage points for a new substrate.' + manual)
+        else:
+            st.success('Inside the measured domain. Cross-validated error for new conditions is well under 1 percentage point.')
+
+        product_smiles = imine_product(ald_smiles, amine_smiles) if ald_smiles and amine_smiles else None
+        if product_smiles:
+            scheme([('mol', ald_smiles, ald_name), ('op', '+'), ('mol', amine_smiles, amine_name),
+                    ('arrow', f'{p_solvent}, {p_temp:g} °C', f'{p_time:g} min · predicted {centre[0, 0]:.0f}%'),
+                    ('mol', product_smiles, 'imine product'), ('op', '+'), ('mol', 'O', 'water')])
+            product = Chem.MolFromSmiles(product_smiles)
+            st.caption(f'Product: {rdMolDescriptors.CalcMolFormula(product)}, MW {Descriptors.MolWt(product):.2f} g/mol, '
+                       f'SMILES {product_smiles}')
+
+        t_grid = np.linspace(0, max(p_time, TIME_HI) * 1.15, 150)
         fig = go.Figure()
         if show_gp:
-            c_mid, c_lo, c_hi, _, _ = predict_conversion_gp(gp_model, feats, [p_time], ORDER)
-            fig.add_scatter(x=np.r_[temp_grid, temp_grid[::-1]], y=np.r_[c_hi[:, 0], c_lo[::-1, 0]], fill='toself',
-                            line=dict(width=0), fillcolor='rgba(122,184,245,0.22)', name='GP 95% interval', hoverinfo='skip')
-            fig.add_scatter(x=temp_grid, y=c_mid[:, 0], mode='lines', line=dict(color='#7AB8F5', width=3), name='Kinetic GP')
+            c_mid, c_lo, c_hi, _, _ = predict_conversion_gp(gp_model, feat, t_grid, ORDER)
+            fig.add_scatter(x=np.r_[t_grid, t_grid[::-1]], y=np.r_[c_hi[0], c_lo[0][::-1]], fill='toself', line=dict(width=0),
+                            fillcolor='rgba(122,184,245,0.22)', name='GP 95% interval', hoverinfo='skip')
+            fig.add_scatter(x=t_grid, y=c_mid[0], mode='lines', line=dict(color='#7AB8F5', width=3), name='Kinetic GP')
         if show_gbm:
-            fig.add_scatter(x=temp_grid, y=predict_conversion_gbm(gbm_model, feats, [p_time])[:, 0], mode='lines',
+            fig.add_scatter(x=t_grid, y=predict_conversion_gbm(gbm_model, feat, t_grid)[0], mode='lines',
                             line=dict(color='#E8B04B', width=2, dash='dash'), name='Direct GBM')
-        fig.add_vrect(x0=T_LO, x1=T_HI, fillcolor='rgba(124,199,154,0.12)', line_width=0)
-        fig.add_vline(x=p_temp, line_dash='dot', line_color='gray')
-        fig.update_layout(xaxis_title='Temperature (°C)', yaxis_title='Conversion (%)', hovermode='x unified',
+        if measured_pair:
+            measured = data[(data.aldehyde_name == ald_name) & (data.amine_name == amine_match) & (data.solvent == p_solvent)
+                            & (data.temperature_C == p_temp)]
+            if not measured.empty:
+                fig.add_scatter(x=measured.time_min, y=measured.conversion_percent, mode='markers', name='Measured',
+                                marker=dict(size=11, color='#E8615C', symbol='diamond'))
+        fig.add_vrect(x0=TIME_HI, x1=t_grid.max(), fillcolor='rgba(127,127,127,0.12)', line_width=0)
+        fig.add_vline(x=p_time, line_dash='dot', line_color='gray')
+        fig.update_layout(xaxis_title='Time (min)', yaxis_title='Conversion (%)', hovermode='x unified',
                           legend=dict(orientation='h', yanchor='bottom', y=1.02, x=0), margin=dict(t=80))
         fig.update_yaxes(range=[0, 102])
-        show(fig, 'predicted_temperature_response', height=380)
-        st.caption('Green band: measured temperature range.' + (' Note how the GBM goes flat outside it: trees cannot extrapolate.'
-                                                                if show_gbm else ''))
+        a, b = st.columns(2)
+        with a:
+            st.markdown('**Predicted time course**')
+            show(fig, 'predicted_time_course', height=380)
+            st.caption('Grey band: beyond the longest measured time.')
+        with b:
+            st.markdown(f'**Temperature response at {p_time:g} min**')
+            temp_grid = np.linspace(0, 60, 61)
+            feats = np.column_stack([np.repeat(feat[:, :4], len(temp_grid), axis=0), 1000 / (temp_grid + 273.15)])
+            fig = go.Figure()
+            if show_gp:
+                c_mid, c_lo, c_hi, _, _ = predict_conversion_gp(gp_model, feats, [p_time], ORDER)
+                fig.add_scatter(x=np.r_[temp_grid, temp_grid[::-1]], y=np.r_[c_hi[:, 0], c_lo[::-1, 0]], fill='toself',
+                                line=dict(width=0), fillcolor='rgba(122,184,245,0.22)', name='GP 95% interval', hoverinfo='skip')
+                fig.add_scatter(x=temp_grid, y=c_mid[:, 0], mode='lines', line=dict(color='#7AB8F5', width=3), name='Kinetic GP')
+            if show_gbm:
+                fig.add_scatter(x=temp_grid, y=predict_conversion_gbm(gbm_model, feats, [p_time])[:, 0], mode='lines',
+                                line=dict(color='#E8B04B', width=2, dash='dash'), name='Direct GBM')
+            fig.add_vrect(x0=T_LO, x1=T_HI, fillcolor='rgba(124,199,154,0.12)', line_width=0)
+            fig.add_vline(x=p_temp, line_dash='dot', line_color='gray')
+            fig.update_layout(xaxis_title='Temperature (°C)', yaxis_title='Conversion (%)', hovermode='x unified',
+                              legend=dict(orientation='h', yanchor='bottom', y=1.02, x=0), margin=dict(t=80))
+            fig.update_yaxes(range=[0, 102])
+            show(fig, 'predicted_temperature_response', height=380)
+            st.caption('Green band: measured temperature range.' + (' Note how the GBM goes flat outside it: trees cannot extrapolate.'
+                                                                    if show_gbm else ''))
 
     with st.expander('Batch predictions from a CSV'):
-        st.markdown('Columns: `solvent`, `temperature_C`, `time_min`, plus either `aldehyde_R_group` or `sigma_p` (and optionally '
-                    '`sigma_p_plus`), and either `amine_name` or `taft_Es`.')
-        template = pd.DataFrame({'aldehyde_R_group': ['H', 'NO2', ''], 'sigma_p': ['', '', 0.23], 'sigma_p_plus': ['', '', 0.15],
-                                 'amine_name': ['n-butylamine', 'tert-butylamine', ''], 'taft_Es': ['', '', -0.93],
-                                 'solvent': ['DCM', 'MTBE', 'DCM'], 'temperature_C': [25, 35, 20], 'time_min': [60, 80, 45]})
+        st.markdown('Columns: `solvent`, `temperature_C`, `time_min`; the aldehyde as `aldehyde_SMILES`, `aldehyde_R_group` or `sigma_p` '
+                    '(optionally `sigma_p_plus`); the amine as `amine_SMILES`, `amine_name` or `taft_Es`.')
+        template = pd.DataFrame({'aldehyde_SMILES': ['', '', 'O=Cc1ccc(Br)cc1', ''], 'aldehyde_R_group': ['H', 'NO2', '', ''],
+                                 'sigma_p': ['', '', '', 0.06], 'sigma_p_plus': ['', '', '', -0.07],
+                                 'amine_SMILES': ['', '', 'NCC(C)C', ''], 'amine_name': ['n-butylamine', 'tert-butylamine', '', ''],
+                                 'taft_Es': ['', '', '', -0.47],
+                                 'solvent': ['DCM', 'MTBE', 'DCM', 'MTBE'], 'temperature_C': [25, 35, 20, 30], 'time_min': [60, 80, 45, 30]})
         st.download_button('Download template', template.to_csv(index=False).encode(), file_name='prediction_template.csv', mime='text/csv')
         batch_file = st.file_uploader('Upload conditions', type='csv', key='batch_file')
         if batch_file is not None:
             batch = pd.read_csv(batch_file)
             try:
                 b = batch.copy()
+                # Structures given as SMILES are converted to descriptors first.
+                if 'aldehyde_SMILES' in b:
+                    described = [describe_aldehyde(x) if isinstance(x, str) and x.strip() else {} for x in b.aldehyde_SMILES]
+                    for col, key in (('sigma_p', 'sigma_p'), ('sigma_p_plus', 'sigma_p_plus')):
+                        derived = pd.Series([d.get(key) if d.get('ok') else np.nan for d in described], index=b.index, dtype=float)
+                        b[col] = b[col].fillna(derived) if col in b else derived
+                if 'amine_SMILES' in b:
+                    described = [describe_amine(x) if isinstance(x, str) and x.strip() else {} for x in b.amine_SMILES]
+                    derived = pd.Series([d.get('taft_Es') if d.get('ok') else np.nan for d in described], index=b.index, dtype=float)
+                    b['taft_Es'] = b['taft_Es'].fillna(derived) if 'taft_Es' in b else derived
                 if 'sigma_p' not in b or b.sigma_p.isna().any():
                     b['sigma_p'] = b.get('sigma_p', pd.Series(np.nan, index=b.index)).fillna(b.aldehyde_R_group.map(HAMMETT_SIGMA_P))
                 if 'sigma_p_plus' not in b or b.sigma_p_plus.isna().any():
@@ -1013,7 +1123,7 @@ with tab4:
 | Tab | Use it to |
 |---|---|
 | Reaction scheme | See the reaction, any specific example, and the substrate set with σ / Eₛ values |
-| Predict | ML predictions of conversion, rate and time to target for any reactants and conditions, with batch CSV mode |
+| Predict | ML predictions of conversion, rate and time to target. Pick dataset reactants or enter your own structure (SMILES, drawing or name); batch CSV mode |
 | Time courses | Compare averaged conversion curves by temperature and solvent |
 | Kinetics | Choose a rate law, inspect fits and residuals, map rate constants, plan conditions |
 | Hammett & Taft | Electronic (ρ) and steric (δ) sensitivity, how ρ changes with conditions, σp vs σp⁺ |
