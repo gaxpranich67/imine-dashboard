@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+from scipy import stats as scipy_stats
 import streamlit as st
 from rdkit import Chem
 from rdkit.Chem import Crippen, Descriptors, rdMolDescriptors
@@ -69,9 +70,9 @@ APP_CSS = '''<style>
 [data-testid="stMetricLabel"] p {font-size: 0.74rem; font-weight: 500; letter-spacing: 0.06em; text-transform: uppercase; opacity: 0.72;}
 [data-testid="stMetricValue"] {letter-spacing: -0.01em;}
 /* Tabs */
-.stTabs [role="tablist"] {gap: 0.3rem; padding-bottom: 0.5rem; border-bottom: 1px solid rgba(127,127,127,0.22); box-shadow: none;}
-.stTabs [data-testid="stTab"] {padding: 0.45rem 0.9rem; border-radius: 0.6rem; border: 1px solid transparent; transition: background 0.15s;}
-.stTabs [data-testid="stTab"] p {font-size: 0.9rem; font-weight: 500;}
+.stTabs [role="tablist"] {gap: 0.1rem; flex-wrap: wrap; row-gap: 0.3rem; padding-bottom: 0.5rem; border-bottom: 1px solid rgba(127,127,127,0.22); box-shadow: none;}
+.stTabs [data-testid="stTab"] {padding: 0.38rem 0.6rem; border-radius: 0.6rem; border: 1px solid transparent; transition: background 0.15s;}
+.stTabs [data-testid="stTab"] p {font-size: 0.86rem; font-weight: 500; white-space: nowrap;}
 .stTabs [data-testid="stTab"]:hover {background: rgba(127,127,127,0.10);}
 .stTabs [data-testid="stTab"][aria-selected="true"] {background: rgba(122,184,245,0.15); border-color: rgba(122,184,245,0.5);}
 .stTabs .react-aria-SelectionIndicator {display: none;}
@@ -1148,51 +1149,255 @@ with tab3:
 Averages across the whole dataset can mislead, because the groups being compared may differ in other ways too.
 This tab avoids that by **pairing experiments that are identical except for the one variable you choose**.
 
-1. Pick a comparison, e.g. *Solvent: MTBE − DCM*.
-2. Every MTBE measurement is paired with the DCM measurement that has the **same aldehyde, amine, temperature and time**.
-3. For each pair the tab computes **conversion(MTBE) − conversion(DCM)** in percentage points.
-4. The histogram shows how those differences are spread; the headline number is their mean.
+1. Pick the **variable** to change and the two **levels** to compare: a baseline (A) and a comparison (B).
+2. Every B experiment is paired with the A experiment that matches it on **all other recorded variables**
+   (aldehyde, amine, solvent, temperature and time, minus the one you are changing).
+3. **Conversion** compares each pair as B − A in percentage points. **Rate constant** compares the fitted k_app of whole
+   time courses as the ratio k_B / k_A, which avoids the ceiling at 100% conversion.
+4. The cards summarise the pairs: mean with 95% confidence interval, median, how often B beats A, and a Wilcoxon
+   signed-rank test of whether the differences are centred on zero.
 
-**Reading it.** Bars right of the dashed zero line are pairs where the second-named condition (MTBE, 35 °C or n-butylamine) gave
-higher conversion. A narrow cluster means the effect is consistent; a wide spread means it depends on the other variables, so open
-*See matched experiments* to find where it is large or small. Differences are in percentage points, not percent change
-(40% → 50% is +10 pp).
+**Reading the charts.** The histogram shows how consistent the effect is. In the paired plot every point is one pair;
+points above the diagonal are pairs where B is higher. The breakdown heatmap shows where the effect is large or small
+(red = B higher, blue = A higher). *All comparisons* at the bottom ranks every pair of levels for every variable.
 
-**Filters.** Only experiments allowed by the sidebar are paired, and both conditions being compared must be selected there.
+Differences are in percentage points, not percent change (40% → 50% is +10 pp). Only experiments allowed by the sidebar
+filters are paired. Each pair is one combination of conditions, not an independent replicate, so treat p-values as descriptive.
 ''')
-    comparison = st.radio('Change one variable while holding the others fixed',
-                          ['Solvent: MTBE − DCM', 'Temperature: 35 − 15 °C',
-                           'Amine: n-butylamine − tert-butylamine'], horizontal=True)
-    if comparison.startswith('Solvent'):
-        variable, low, high = 'solvent', 'DCM', 'MTBE'
-    elif comparison.startswith('Temperature'):
-        variable, low, high = 'temperature_C', 15, 35
+
+    MC_KEYS = ['aldehyde_R_group', 'amine_name', 'solvent', 'temperature_C', 'time_min']
+    MC_VARIABLES = {'Aldehyde substituent': 'aldehyde_R_group', 'Amine': 'amine_name', 'Solvent': 'solvent',
+                    'Temperature': 'temperature_C', 'Reaction time': 'time_min'}
+    MC_NAMES = {v: k for k, v in MC_VARIABLES.items()}
+
+    def mc_order(col, values):
+        values = list(dict.fromkeys(values))
+        if col == 'aldehyde_R_group':
+            return sorted(values, key=lambda r: (HAMMETT_SIGMA_P.get(r, 99), r))
+        if col == 'amine_name':
+            return sorted(values, key=lambda a: (list(AMINE_NOTES).index(a) if a in AMINE_NOTES else 99, a))
+        return sorted(values)
+
+    def mc_label(col, value):
+        if col == 'aldehyde_R_group':
+            return f'R = {sub_label(value)}'
+        if col == 'temperature_C':
+            return f'{value:g} °C'
+        if col == 'time_min':
+            return f'{value:g} min'
+        return str(value)
+
+    def mc_pairs(frame, col, a, b, value):
+        keys = [k for k in MC_KEYS if k in frame.columns and k != col]
+        table = frame[frame[col].isin([a, b])].pivot_table(index=keys, columns=col, values=value, aggfunc='mean')
+        if a not in table.columns or b not in table.columns:
+            return pd.DataFrame()
+        table = table[[a, b]].dropna().reset_index()
+        table.columns = keys + ['A', 'B']
+        return table
+
+    def mc_stats(diff):
+        diff = np.asarray(diff, float)
+        n = len(diff)
+        out = {'n': n, 'mean': diff.mean() if n else np.nan, 'median': np.median(diff) if n else np.nan,
+               'q1': np.percentile(diff, 25) if n else np.nan, 'q3': np.percentile(diff, 75) if n else np.nan,
+               'lo': np.nan, 'hi': np.nan, 'b_wins': (diff > 0).mean() if n else np.nan,
+               'a_wins': (diff < 0).mean() if n else np.nan, 'p': np.nan}
+        if n >= 2:
+            half = scipy_stats.t.ppf(0.975, n - 1) * diff.std(ddof=1) / np.sqrt(n)
+            out['lo'], out['hi'] = out['mean'] - half, out['mean'] + half
+        if n >= 6 and np.any(diff != 0):
+            try:
+                out['p'] = float(scipy_stats.wilcoxon(diff).pvalue)
+            except ValueError:
+                pass
+        return out
+
+    def fmt_p(p):
+        return '—' if not np.isfinite(p) else ('< 0.001' if p < 0.001 else f'{p:.3f}')
+
+    st.markdown('#### Single comparison')
+    c1, c2, c3, c4 = st.columns([2, 2, 2, 2])
+    mc_var_name = c1.selectbox('Variable to change', list(MC_VARIABLES), index=2, key='mc_var')
+    mc_col = MC_VARIABLES[mc_var_name]
+    mc_levels = mc_order(mc_col, filtered[mc_col].unique())
+    if len(mc_levels) < 2:
+        st.info(f'Only one {mc_var_name.lower()} is selected in the sidebar. Select at least two to compare.')
     else:
-        variable, low, high = 'amine_name', 'tert-butylamine', 'n-butylamine'
-    keys = ['aldehyde_name', 'amine_name', 'solvent', 'temperature_C', 'time_min']
-    match_keys = [key for key in keys if key != variable]
-    pairs = filtered.pivot_table(index=match_keys, columns=variable,
-                                 values='conversion_percent', aggfunc='mean')
-    if low not in pairs.columns or high not in pairs.columns:
-        st.info('Select both comparison groups in the sidebar to see matched pairs.')
-    else:
-        pairs = pairs[[low, high]].dropna().reset_index()
-        pairs.columns = [str(c) for c in pairs.columns]
-        low, high = str(low), str(high)
+        mc_a = c2.selectbox('Baseline (A)', mc_levels, index=0, format_func=lambda v: mc_label(mc_col, v), key=f'mc_a_{mc_col}')
+        b_options = [v for v in mc_levels if v != mc_a]
+        mc_b = c3.selectbox('Compared with (B)', b_options, index=len(b_options) - 1, format_func=lambda v: mc_label(mc_col, v),
+                            key=f'mc_b_{mc_col}')
+        rate_ok = mc_col != 'time_min'
+        mc_measure = c4.radio('Measure', ['Conversion', 'Rate constant'] if rate_ok else ['Conversion'], horizontal=True, key='mc_measure',
+                              help='Rate constant compares fitted k_app of whole time courses (Kinetics tab), so time is not a variable there.')
+        use_rate = mc_measure == 'Rate constant'
+        source = kin if use_rate else filtered
+        pairs = mc_pairs(source, mc_col, mc_a, mc_b, 'k_app_per_min' if use_rate else 'conversion_percent')
+        la, lb = mc_label(mc_col, mc_a), mc_label(mc_col, mc_b)
         if pairs.empty:
             st.info('No matched pairs remain under these filters.')
         else:
-            pairs['Difference (percentage points)'] = pairs[high] - pairs[low]
-            change = pairs['Difference (percentage points)']
-            st.metric('Mean matched difference', f'{change.mean():+.1f} percentage points')
-            st.caption(f'{len(pairs)} matched pairs. Positive means {high} has higher conversion than {low}; this is not a percent change.')
-            fig = px.histogram(pairs, x='Difference (percentage points)', nbins=25,
-                               labels={'count': 'Matched pairs'})
-            fig.update_yaxes(title_text='Matched pairs')
+            if use_rate:
+                pairs['effect'] = np.log10(pairs.B / pairs.A)
+                stt = mc_stats(pairs.effect)
+                fold = lambda v: 10 ** v
+                m = st.columns(5)
+                m[0].metric('Matched pairs', f'{stt["n"]}', help='Time courses matched on every other variable')
+                m[1].metric('Geometric-mean k_B / k_A', f'{fold(stt["mean"]):.3g}×')
+                m[1].caption(f'95% CI {fold(stt["lo"]):.3g}–{fold(stt["hi"]):.3g}×')
+                m[2].metric('Median k_B / k_A', f'{fold(stt["median"]):.3g}×')
+                m[2].caption(f'IQR {fold(stt["q1"]):.3g}–{fold(stt["q3"]):.3g}×')
+                m[3].metric(f'{lb} faster in', f'{stt["b_wins"] * 100:.0f}%', help='Share of matched time courses where k_B > k_A')
+                m[3].caption(f'of {stt["n"]} pairs')
+                m[4].metric('Wilcoxon p', fmt_p(stt['p']), help='Signed-rank test on log(k_B/k_A); tests whether the ratio is centred on 1.')
+                direction = 'faster' if stt['mean'] > 0 else 'slower'
+                st.markdown(f'With **{lb}** the reaction is on average **{fold(abs(stt["mean"])):.3g}× {direction}** '
+                            f'than with **{la}**, and {lb} is faster in **{stt["b_wins"] * 100:.0f}%** of {stt["n"]} matched time courses.')
+            else:
+                pairs['effect'] = pairs.B - pairs.A
+                stt = mc_stats(pairs.effect)
+                m = st.columns(5)
+                m[0].metric('Matched pairs', f'{stt["n"]}', help='Measurements matched on every other variable')
+                m[1].metric('Mean difference', f'{stt["mean"]:+.1f} pp')
+                m[1].caption(f'95% CI {stt["lo"]:+.1f} to {stt["hi"]:+.1f} pp')
+                m[2].metric('Median difference', f'{stt["median"]:+.1f} pp')
+                m[2].caption(f'IQR {stt["q1"]:+.1f} to {stt["q3"]:+.1f} pp')
+                m[3].metric(f'{lb} higher in', f'{stt["b_wins"] * 100:.0f}%', help='Share of matched pairs where B > A')
+                m[3].caption(f'{la} higher in {stt["a_wins"] * 100:.0f}%; ties {max(0.0, 100 - (stt["b_wins"] + stt["a_wins"]) * 100):.0f}%')
+                m[4].metric('Wilcoxon p', fmt_p(stt['p']), help='Signed-rank test of whether the paired differences are centred on zero.')
+                st.markdown(f'Switching from **{la}** to **{lb}** changes conversion by **{stt["mean"]:+.1f} percentage points** on average '
+                            f'(95% CI {stt["lo"]:+.1f} to {stt["hi"]:+.1f}); {lb} gives higher conversion in **{stt["b_wins"] * 100:.0f}%** '
+                            f'of {stt["n"]} matched pairs.')
+
+            others = [k for k in MC_KEYS if k in pairs.columns]
+            g1, g2 = st.columns(2)
+            with g1:
+                st.markdown('**Distribution of paired effects**')
+                xlab = f'log₁₀(k_B / k_A)' if use_rate else 'B − A (percentage points)'
+                fig = px.histogram(pairs, x='effect', nbins=30, labels={'effect': xlab}, color_discrete_sequence=['#7AB8F5'])
+                fig.update_traces(marker_line_width=0.5, marker_line_color='rgba(0,0,0,0.3)')
+                fig.add_vline(x=0, line_dash='dash', line_color='gray')
+                fig.add_vline(x=stt['mean'], line_color='#E8615C', line_width=2,
+                              annotation_text='mean', annotation_font_color='#E8615C', annotation_position='top')
+                fig.update_yaxes(title_text='Matched pairs')
+                show(fig, 'matched_distribution', height=380)
+            with g2:
+                st.markdown('**Paired values**')
+                colour_by = st.selectbox('Colour points by', [MC_NAMES[k] for k in others], key='mc_colour',
+                                         label_visibility='collapsed')
+                ccol = MC_VARIABLES[colour_by]
+                plot = pairs.assign(group=pairs[ccol].map(lambda v: mc_label(ccol, v)))
+                order = [mc_label(ccol, v) for v in mc_order(ccol, pairs[ccol].unique())]
+                fig = px.scatter(plot, x='A', y='B', color='group', category_orders={'group': order}, opacity=0.8,
+                                 color_discrete_map=({mc_label(ccol, r): SUB_COLORS.get(r, '#999') for r in pairs[ccol].unique()}
+                                                     if ccol == 'aldehyde_R_group' else
+                                                     {a: AMINE_COLORS.get(a, '#999') for a in pairs[ccol].unique()} if ccol == 'amine_name' else None),
+                                 labels={'A': f'{la} ({"k_app, min⁻¹" if use_rate else "conversion, %"})',
+                                         'B': f'{lb} ({"k_app, min⁻¹" if use_rate else "conversion, %"})', 'group': colour_by})
+                lo_v = min(pairs.A.min(), pairs.B.min())
+                hi_v = max(pairs.A.max(), pairs.B.max())
+                fig.add_scatter(x=[lo_v, hi_v], y=[lo_v, hi_v], mode='lines', line=dict(color='gray', dash='dash'),
+                                name='no change', hoverinfo='skip')
+                fig.update_traces(marker_size=8, selector=dict(mode='markers'))
+                if use_rate:
+                    fig.update_xaxes(type='log')
+                    fig.update_yaxes(type='log')
+                show(fig, 'matched_paired', height=340)
+
+            if len(others) >= 1:
+                st.markdown('**Where is the effect largest?**')
+                b1, b2 = st.columns(2)
+                row_name = b1.selectbox('Rows', [MC_NAMES[k] for k in others], index=0, key='mc_rows')
+                col_choices = ['(none)'] + [MC_NAMES[k] for k in others if MC_NAMES[k] != row_name]
+                col_name = b2.selectbox('Columns', col_choices, index=1 if len(col_choices) > 1 else 0, key='mc_cols')
+                rcol = MC_VARIABLES[row_name]
+                if col_name == '(none)':
+                    grid = pairs.groupby(rcol).effect.mean().to_frame('mean effect')
+                    grid.index = [mc_label(rcol, v) for v in grid.index]
+                    grid = grid.reindex([mc_label(rcol, v) for v in mc_order(rcol, pairs[rcol].unique())])
+                else:
+                    ccol2 = MC_VARIABLES[col_name]
+                    grid = pairs.pivot_table(index=rcol, columns=ccol2, values='effect', aggfunc='mean')
+                    grid = grid.reindex(index=mc_order(rcol, grid.index), columns=mc_order(ccol2, grid.columns))
+                    grid.index = [mc_label(rcol, v) for v in grid.index]
+                    grid.columns = [mc_label(ccol2, v) for v in grid.columns]
+                bound = float(np.nanmax(np.abs(grid.to_numpy()))) or 1.0
+                fig = px.imshow(grid, color_continuous_scale=BLUE_RED_SCALE, zmin=-bound, zmax=bound, aspect='auto',
+                                text_auto='.2f' if use_rate else '+.1f',
+                                labels={'color': 'mean log₁₀(k_B/k_A)' if use_rate else 'mean B − A (pp)'})
+                fig.update_traces(xgap=2, ygap=2)
+                show(fig, 'matched_breakdown', height=max(260, 48 * len(grid) + 120))
+                st.caption(f'Each cell is the mean paired effect of {la} → {lb} for that subset. Red: {lb} higher; blue: {la} higher; '
+                           'white: no change. The colour range is symmetric about zero.')
+
+            with st.expander(f'See all {len(pairs)} matched pairs'):
+                shown_pairs = pairs.rename(columns={'A': la, 'B': lb, 'effect': 'log10(k_B/k_A)' if use_rate else 'B − A (pp)'})
+                st.dataframe(shown_pairs, hide_index=True, width='stretch')
+                st.download_button('Download matched pairs (CSV)', shown_pairs.to_csv(index=False).encode(),
+                                   file_name=f'matched_{mc_col}_{mc_a}_vs_{mc_b}.csv', mime='text/csv')
+
+    st.markdown('#### All comparisons')
+    st.caption('Every pair of levels for every variable, matched on all other variables, using the current sidebar filters. '
+               'Conversion effects in percentage points; rate effects as the geometric-mean k ratio.')
+    rows = []
+    for name, col in MC_VARIABLES.items():
+        levels = mc_order(col, filtered[col].unique())
+        for i, a in enumerate(levels):
+            for b in levels[i + 1:]:
+                cp = mc_pairs(filtered, col, a, b, 'conversion_percent')
+                if cp.empty:
+                    continue
+                cs = mc_stats(cp.B - cp.A)
+                rp = mc_pairs(kin, col, a, b, 'k_app_per_min') if col in kin.columns and col != 'time_min' else pd.DataFrame()
+                rs = mc_stats(np.log10(rp.B / rp.A)) if not rp.empty else None
+                rows.append({'Variable': name, 'A': mc_label(col, a), 'B': mc_label(col, b), 'Pairs': cs['n'],
+                             'Mean B − A (pp)': cs['mean'], 'CI low': cs['lo'], 'CI high': cs['hi'],
+                             'B higher (%)': cs['b_wins'] * 100, 'p (Wilcoxon)': cs['p'],
+                             'k_B / k_A': 10 ** rs['mean'] if rs else np.nan, 'adjacent': b == levels[i + 1]})
+    if not rows:
+        st.info('Select at least two levels of some variable in the sidebar.')
+    else:
+        overview = pd.DataFrame(rows)
+        f1, f2 = st.columns([3, 2])
+        show_vars = f1.pills('Variables', list(MC_VARIABLES), selection_mode='multi', default=list(MC_VARIABLES), key='mc_overview_vars')
+        adjacent_only = f2.toggle('Adjacent levels only', value=False, key='mc_adjacent',
+                                  help='e.g. 15→25 and 25→35 °C, but not 15→35 °C. Substituents are ordered by σp, amines by bulk.')
+        view = overview[overview.Variable.isin(show_vars or [])]
+        if adjacent_only:
+            view = view[view.adjacent]
+        if view.empty:
+            st.info('Nothing to show: choose at least one variable.')
+        else:
+            view = view.iloc[::-1]
+            labels = view.A + ' → ' + view.B
+            var_colors = dict(zip(MC_VARIABLES, ['#E8615C', '#B48CE0', '#7CC79A', '#E8B04B', '#7AB8F5']))
+            fig = go.Figure()
+            for name in MC_VARIABLES:
+                part = view[view.Variable == name]
+                if part.empty:
+                    continue
+                fig.add_scatter(x=part['Mean B − A (pp)'], y=(part.A + ' → ' + part.B), mode='markers', name=name,
+                                marker=dict(size=10, color=var_colors[name]),
+                                error_x=dict(type='data', symmetric=False, array=part['CI high'] - part['Mean B − A (pp)'],
+                                             arrayminus=part['Mean B − A (pp)'] - part['CI low'], thickness=1.5, width=0),
+                                customdata=np.column_stack([part.Pairs, part['B higher (%)']]),
+                                hovertemplate='%{y}<br>mean %{x:+.1f} pp<br>%{customdata[0]} pairs, B higher in %{customdata[1]:.0f}%<extra></extra>')
             fig.add_vline(x=0, line_dash='dash', line_color='gray')
-            show(fig, 'matched_differences', height=380)
-            with st.expander('See matched experiments'):
-                st.dataframe(pairs, hide_index=True, width='stretch')
+            fig.update_layout(xaxis_title='Mean paired difference, B − A (percentage points, 95% CI)',
+                              yaxis=dict(categoryorder='array', categoryarray=list(labels)),
+                              legend=dict(orientation='h', yanchor='bottom', y=1.01, x=0), margin=dict(t=70))
+            show(fig, 'matched_overview_forest', height=max(320, 26 * len(view) + 140))
+            table = view.iloc[::-1].drop(columns='adjacent')
+            st.dataframe(table, hide_index=True, width='stretch', column_config={
+                'Mean B − A (pp)': st.column_config.NumberColumn(format='%+.1f'),
+                'CI low': st.column_config.NumberColumn('95% CI low', format='%+.1f'),
+                'CI high': st.column_config.NumberColumn('95% CI high', format='%+.1f'),
+                'B higher (%)': st.column_config.ProgressColumn('B higher', format='%.0f%%', min_value=0, max_value=100),
+                'p (Wilcoxon)': st.column_config.NumberColumn(format='%.2g'),
+                'k_B / k_A': st.column_config.NumberColumn('k_B / k_A (geo-mean)', format='%.3g')})
+            st.download_button('Download all comparisons (CSV)', table.to_csv(index=False).encode(),
+                               file_name='matched_comparisons_overview.csv', mime='text/csv')
 
 with tab4:
     st.subheader('Find an observed condition')
